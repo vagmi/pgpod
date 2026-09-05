@@ -1,0 +1,40 @@
+#cloud-config
+# Ubuntu 26.04 (Resolute Raccoon) cloud-init for pgpod integration testing.
+#
+# Rendered from this template at create time so the caller's SSH public key
+# is never committed. See vm.sh.
+#
+# This installs the runtime stack only. Provisioning proper — the service
+# user, subuid ranges, linger, and the podman socket — is left to
+# ops/provision-node.sh, so that the script the VM exercises is the same
+# one a real deployment runs.
+
+hostname: pgpod-testvm
+
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: false
+    ssh_authorized_keys:
+      - %%SSH_PUBLIC_KEY%%
+
+package_update: true
+packages:
+  - podman
+  - uidmap
+  - passt
+  - netavark
+  - aardvark-dns
+  - fuse-overlayfs
+  - jq
+  - ca-certificates
+
+runcmd:
+  # Enable the rootless socket for the interactive `ubuntu` user so a
+  # freshly booted VM is immediately useful for poking at podman by hand.
+  # ops/provision-node.sh does the equivalent for the service user.
+  - [ loginctl, enable-linger, ubuntu ]
+  - [ su, -l, ubuntu, -c, "systemctl --user enable --now podman.socket" ]
+
+final_message: "pgpod-testvm ready after $UPTIME seconds"

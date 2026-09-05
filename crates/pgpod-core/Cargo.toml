@@ -1,0 +1,13 @@
+[package]
+name = "pgpod-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared types for pgpod: identifiers, lifecycle phases, path layout"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+dirs.workspace = true

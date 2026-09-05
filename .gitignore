@@ -1,0 +1,12 @@
+/target
+/references/*/target
+
+references
+# Test VM artifacts — the base cloud image is ~800M and the per-VM
+# overlay is generated.
+/ops/testvm/images/
+/ops/testvm/seed*.iso
+/ops/testvm/user-data
+
+# Local overrides
+/.pgpod-home/

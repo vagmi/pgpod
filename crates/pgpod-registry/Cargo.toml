@@ -1,0 +1,13 @@
+[package]
+name = "pgpod-registry"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite state store for pgpod"
+
+[dependencies]
+pgpod-core.workspace = true
+thiserror.workspace = true
+serde.workspace = true

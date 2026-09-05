@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/pgpod-core",
+    "crates/pgpod-store",
+    "crates/pgpod-runtime",
+    "crates/pgpod-pg",
+    "crates/pgpod-registry",
+    "crates/pgpod-control",
+    "crates/pgpod-agent",
+    "crates/pgpod-cli",
+]
+
+exclude = ["references"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/vagmi/pgpod"
+
+[workspace.dependencies]
+# In-workspace crates
+pgpod-core = { path = "crates/pgpod-core" }
+pgpod-store = { path = "crates/pgpod-store" }
+pgpod-runtime = { path = "crates/pgpod-runtime" }
+pgpod-pg = { path = "crates/pgpod-pg" }
+pgpod-registry = { path = "crates/pgpod-registry" }
+pgpod-control = { path = "crates/pgpod-control" }
+
+# Cross-crate essentials
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process", "fs"] }
+futures = "0.3"
+
+# Runtime
+podman-api = "0.10"
+nix = { version = "0.30", features = ["user", "fs", "resource"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+
+# Declared once here so later phases opt in with `workspace = true`
+# rather than re-picking versions per crate.
+rusqlite = { version = "0.37", features = ["bundled"] }
+refinery = { version = "0.8", features = ["rusqlite"] }
+object_store = "0.14"
+serde_yaml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3"

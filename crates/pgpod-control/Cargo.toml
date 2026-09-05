@@ -1,0 +1,16 @@
+[package]
+name = "pgpod-control"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "pgpod control plane: reconciler, scheduler, and the library facade"
+
+[dependencies]
+pgpod-core.workspace = true
+pgpod-runtime.workspace = true
+pgpod-registry.workspace = true
+pgpod-pg.workspace = true
+thiserror.workspace = true
+serde.workspace = true

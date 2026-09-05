@@ -1,0 +1,13 @@
+[package]
+name = "pgpod-pg"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PostgreSQL domain logic for pgpod: config rendering, bootstrap planning, recovery"
+
+[dependencies]
+pgpod-core.workspace = true
+thiserror.workspace = true
+serde.workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "pgpod-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rootless Podman client for pgpod: containers, volumes, networks, secrets"
+
+[dependencies]
+pgpod-core.workspace = true
+podman-api.workspace = true
+nix.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[features]
+# Tests that need a live rootless podman socket. Off by default so
+# `cargo test --workspace` stays green on a machine without one.
+podman-tests = []
