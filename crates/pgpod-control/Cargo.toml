@@ -14,3 +14,16 @@ pgpod-registry.workspace = true
 pgpod-pg.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tempfile.workspace = true
+
+[features]
+# Tests that drive a real podman socket and start a real PostgreSQL.
+# Off by default so `cargo test --workspace` stays green without one.
+podman-tests = []

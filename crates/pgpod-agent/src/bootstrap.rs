@@ -28,23 +28,19 @@ const DIR_MODE: u32 = 0o700;
 
 /// Create the directory layout inside the volume.
 pub fn ensure_layout() -> Result<()> {
-    for dir in [container::PGDATA, container::CONF_DIR, container::SPOOL_DIR] {
+    for dir in [
+        container::PGDATA,
+        container::CONF_DIR,
+        container::SPOOL_DIR,
+        // Inside the volume rather than the image's own
+        // /var/run/postgresql — see container::SOCKET_DIR.
+        container::SOCKET_DIR,
+    ] {
         fs::create_dir_all(dir).with_context(|| format!("failed to create {dir}"))?;
         fs::set_permissions(dir, fs::Permissions::from_mode(DIR_MODE))
             .with_context(|| format!("failed to chmod {dir} to 0700"))?;
     }
 
-    // The socket directory is a tmpfs, not part of the volume, so it
-    // starts empty on every container. Stock images ship it pre-created
-    // and podman's `tmpcopyup` preserves that, but a custom image need
-    // not — and a missing socket directory makes postgres fail to start
-    // with a message that points nowhere useful.
-    if let Err(e) = fs::create_dir_all(container::SOCKET_DIR) {
-        warn!(
-            "could not create {}: {e} — postgres may fail to create its socket",
-            container::SOCKET_DIR
-        );
-    }
     Ok(())
 }
 

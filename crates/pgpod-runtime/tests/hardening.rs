@@ -163,26 +163,30 @@ async fn an_unhardened_container_does_not_get_no_new_privileges_for_free() {
     );
 }
 
-/// The read-only rootfs must not make the container useless: postgres
-/// needs a writable socket directory and `/tmp`, which `hardened()`
-/// supplies as tmpfs.
+/// The read-only rootfs must not make the container useless: the tmpfs
+/// mounts `hardened()` supplies have to be writable, and the rootfs must
+/// not be.
+///
+/// Note what is *not* checked here: the postgres socket directory. It
+/// lives inside the instance volume (`container::SOCKET_DIR`) rather than
+/// being a tmpfs over the image's own `/var/run/postgresql`, because
+/// podman's `tmpcopyup` does not preserve that directory's ownership and
+/// the mount comes up root-owned. This container has no volume, so the
+/// socket directory legitimately does not exist.
 #[tokio::test]
-async fn a_hardened_container_can_still_write_where_postgres_needs_to() {
+async fn a_hardened_container_can_still_write_its_tmpfs_mounts() {
     let client = connect().await;
     client.pull_image_if_absent(IMAGE).await.expect("pull");
 
     let name = unique("write");
-    let script = format!(
-        "set -e; \
-         touch /tmp/probe; \
-         touch {socket_dir}/probe; \
+    let script = "set -e; \
+         touch /tmp/probe && echo TMP_OK; \
+         touch /run/secrets/probe && echo SECRETS_OK; \
          if touch /rootfs-probe 2>/dev/null; then echo ROOTFS_WRITABLE; fi; \
-         echo OK",
-        socket_dir = pgpod_core::container::SOCKET_DIR
-    );
+         echo DONE";
     let spec = ContainerSpec::hardened(IMAGE)
         .name(&name)
-        .command(["sh", "-c", &script]);
+        .command(["sh", "-c", script]);
 
     let container = client.create_container(&spec).await.expect("create");
     container.start().await.expect("start");
@@ -193,11 +197,32 @@ async fn a_hardened_container_can_still_write_where_postgres_needs_to() {
         code, 0,
         "hardened container could not write its tmpfs:\n{logs}"
     );
-    assert!(logs.contains("OK"), "{logs}");
+    assert!(logs.contains("TMP_OK"), "/tmp not writable:\n{logs}");
+    assert!(
+        logs.contains("SECRETS_OK"),
+        "/run/secrets not writable — podman could not have created secret \
+         mountpoints here:\n{logs}"
+    );
     assert!(
         !logs.contains("ROOTFS_WRITABLE"),
         "container root filesystem is writable — read_only_fs did not land:\n{logs}"
     );
 
     container.remove(true).await.expect("cleanup");
+}
+
+/// The socket directory must be inside the volume, not the image.
+///
+/// Asserted as a test rather than left to the constant's doc comment
+/// because a well-meaning change back to `/var/run/postgresql` would work
+/// on the stock `postgres` image and fail only on CNPG-style ones, which
+/// is the worst possible place to discover it.
+#[test]
+fn the_socket_directory_lives_inside_the_volume() {
+    assert!(
+        pgpod_core::container::SOCKET_DIR.starts_with(pgpod_core::container::VOLUME_MOUNT),
+        "SOCKET_DIR must be inside the volume so it is writable regardless \
+         of what the image ships: {}",
+        pgpod_core::container::SOCKET_DIR
+    );
 }

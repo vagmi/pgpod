@@ -39,9 +39,22 @@ pub mod container {
     /// Where the static agent binary is bind-mounted read-only.
     pub const AGENT_BIN: &str = "/usr/local/bin/pgpod-agent";
 
-    /// Directory `postgres` expects its unix socket in. Backed by tmpfs
-    /// since the container root filesystem is read-only.
-    pub const SOCKET_DIR: &str = "/var/run/postgresql";
+    /// Where PostgreSQL puts its unix socket.
+    ///
+    /// Inside the volume, **not** the conventional
+    /// `/var/run/postgresql`. That path belongs to the image, and its
+    /// ownership varies: the stock `postgres` images use
+    /// `postgres:postgres`, while CNPG-style images use uid 100 with the
+    /// `postgres` group. Backing it with a tmpfs does not rescue this —
+    /// podman's `tmpcopyup` does not preserve the directory's ownership,
+    /// so the mount comes up root-owned and PostgreSQL cannot create its
+    /// lock file.
+    ///
+    /// The volume is chowned to the container user on first mount by
+    /// construction (ADR 00 §4), so a directory inside it is always
+    /// writable regardless of what the image does. CloudNativePG solves
+    /// this the same way, with its own `/controller/run`.
+    pub const SOCKET_DIR: &str = "/pgdata/run";
 
     /// UID/GID the PostgreSQL container runs as.
     ///

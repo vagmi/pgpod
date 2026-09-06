@@ -172,31 +172,28 @@ impl ContainerSpec {
             read_only_fs: true,
             restart_policy: RestartPolicy::No,
             // A read-only root filesystem means every writable path has
-            // to be an explicit tmpfs. Three are needed, and the third is
-            // not obvious:
+            // to be an explicit tmpfs. Only two are needed:
             //
             // * `/tmp` — scratch.
-            // * the postgres socket directory — the images ship it inside
-            //   the rootfs, which read-only makes unwritable, so postgres
-            //   could not create its socket.
             // * `/run/secrets` — podman materialises mounted secrets here
             //   and must *create* each mountpoint. On a read-only rootfs
             //   that fails during container init with an opaque runc
-            //   error, before anything of ours runs.
+            //   error, before anything of ours runs. A tmpfs at `/run`
+            //   does not substitute: runc creates the secret mountpoints
+            //   before that mount is applied, so the parent of the secret
+            //   targets is what has to be writable.
             //
-            // A tmpfs at `/run` does **not** work in its place: runc
-            // creates the secret mountpoints before that mount is
-            // applied. Verified against podman 6.1 — the parent of the
-            // secret targets is what has to be writable.
+            // The postgres socket directory is deliberately *not* here.
+            // It lives inside the volume (`container::SOCKET_DIR`),
+            // because a tmpfs over the image's own directory comes up
+            // root-owned — `tmpcopyup` does not preserve ownership — and
+            // PostgreSQL then cannot create its lock file.
             mounts: vec![
                 Mount::Tmpfs {
                     target: "/tmp".to_string(),
                 },
                 Mount::Tmpfs {
                     target: SECRETS_DIR.to_string(),
-                },
-                Mount::Tmpfs {
-                    target: pgpod_core::container::SOCKET_DIR.to_string(),
                 },
             ],
             ..Self::new(image)

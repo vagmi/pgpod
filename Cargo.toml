@@ -49,8 +49,9 @@ dirs = "6"
 # Declared once here so later phases opt in with `workspace = true`
 # rather than re-picking versions per crate.
 rusqlite = { version = "0.37", features = ["bundled"] }
-refinery = { version = "0.8", features = ["rusqlite"] }
+refinery = { version = "0.9", features = ["rusqlite"] }
 object_store = "0.14"
 serde_yaml = "0.9"
+rand = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"

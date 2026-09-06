@@ -1,0 +1,43 @@
+# searchbase — a CloudNativePG-based image bundling pgvector, pgvectorscale,
+# and pg_textsearch for hybrid RAG search.
+#   https://github.com/vagmi/searchbase
+#
+# Two fields matter for any CNPG-style image, and both are easy to get
+# wrong in ways that fail confusingly:
+#
+#   postgresUid / postgresGid
+#     The stock `postgres` images run as 999:999. CNPG-based images run as
+#     uid 26 with the `postgres` *group*, which is 102 — the two numbers
+#     differ, so they cannot be assumed equal. Getting this wrong shows up
+#     as "permission denied" reading a mounted secret, because pgpod drops
+#     CAP_DAC_OVERRIDE and podman chowns secrets to exactly this uid/gid.
+#
+#   sharedPreloadLibraries
+#     pg_textsearch has to be loaded at server start; without it the
+#     extension exists but `CREATE EXTENSION` fails.
+#
+# After applying, create the extensions in your database:
+#
+#   pgpod psql search -d appdb
+#   appdb=# CREATE EXTENSION vector;
+#   appdb=# CREATE EXTENSION vectorscale CASCADE;
+#   appdb=# CREATE EXTENSION pg_textsearch;
+
+apiVersion: pgpod/v1
+kind: Cluster
+metadata:
+  name: search
+spec:
+  imageName: ghcr.io/vagmi/searchbase:latest
+
+  postgresUid: 26
+  postgresGid: 102
+
+  bootstrap:
+    initdb:
+      database: appdb
+      owner: app
+
+  postgresql:
+    sharedPreloadLibraries:
+      - pg_textsearch

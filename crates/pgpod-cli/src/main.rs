@@ -1,8 +1,9 @@
 //! `pgpod` — the command-line client.
 //!
-//! Everything here parses arguments, calls the library, and formats the
-//! result. No behaviour lives in this crate (`AGENTS.md` principle 7).
+//! Parses arguments, calls the library, formats output. No behaviour lives
+//! in this crate (`AGENTS.md` principle 7).
 
+mod commands;
 mod doctor;
 mod output;
 
@@ -17,9 +18,9 @@ use crate::output::{CommandOutput, OutputFormat};
     name = "pgpod",
     version,
     about = "A PostgreSQL operator for rootless Podman",
-    long_about = "pgpod manages small PostgreSQL clusters — one primary plus N hot \
-                  standbys — on a single host using rootless Podman, with base \
-                  backups and WAL shipped to object storage."
+    long_about = "pgpod manages small PostgreSQL clusters on a single host using \
+                  rootless Podman, with base backups and WAL shipped to object \
+                  storage."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,10 +34,64 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Check that this host can run pgpod. Run this first.
-    ///
-    /// Exits non-zero if anything must be fixed, so it can gate a
-    /// provisioning script.
     Doctor,
+
+    /// Create or converge a cluster from a manifest.
+    Apply {
+        /// Path to the cluster manifest.
+        #[arg(short = 'f', long = "file")]
+        file: String,
+        /// Seconds to wait for the instance to accept connections.
+        /// `0` returns as soon as the container is started.
+        #[arg(long, default_value_t = 180)]
+        wait: u64,
+    },
+
+    /// Show cluster state. Omit the name to list every cluster.
+    Status { cluster: Option<String> },
+
+    /// Open an interactive psql session against a cluster.
+    Psql {
+        cluster: String,
+        /// Database to connect to.
+        #[arg(short, long)]
+        database: Option<String>,
+    },
+
+    /// Run a command inside an instance container, e.g. `pgpod exec mydb-1 -- ls /pgdata`.
+    Exec {
+        /// Instance, as `<cluster>-<ordinal>`.
+        instance: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
+
+    /// Print an instance's container logs.
+    Logs {
+        /// Instance, as `<cluster>-<ordinal>`.
+        instance: String,
+    },
+
+    /// Where an instance's data actually lives, and how to reach it.
+    #[command(subcommand)]
+    Volume(VolumeCommand),
+
+    /// Remove a cluster's containers. Volumes are kept unless --purge.
+    Delete {
+        cluster: String,
+        /// Also destroy the volumes. **This deletes the databases.**
+        #[arg(long)]
+        purge: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum VolumeCommand {
+    /// Print the host path of an instance's volume.
+    Path {
+        /// Instance, as `<cluster>-<ordinal>`.
+        instance: String,
+    },
 }
 
 #[tokio::main]
@@ -50,16 +105,44 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let layout = PathLayout::from_env();
+    let format = cli.output;
 
     match cli.command {
         Command::Doctor => {
+            let layout = PathLayout::from_env();
             let report = doctor::run(&layout).await;
-            print!("{}", report.render(cli.output));
-            // Diagnostics are the output, so a failing host is a non-zero
-            // exit with a clean report — not an anyhow error dumped over
-            // the top of it.
+            print!("{}", report.render(format));
+            // Diagnostics are the output: a failing host exits non-zero
+            // with a clean report, not an error dumped over the top of it.
             std::process::exit(report.exit_code());
         }
+        Command::Apply { file, wait } => emit(commands::apply(&file, wait).await?, format),
+        Command::Status { cluster } => emit(commands::status(cluster).await?, format),
+        Command::Delete { cluster, purge } => {
+            emit(commands::delete(&cluster, purge).await?, format)
+        }
+        Command::Exec { instance, argv } => {
+            let result = commands::exec(&instance, &argv).await?;
+            let code = result.exit_code;
+            print!("{}", result.render(format));
+            // Propagate the command's own exit code, so `pgpod exec` is
+            // usable in a script's `set -e`.
+            std::process::exit(code.unwrap_or(1));
+        }
+        Command::Logs { instance } => emit(commands::logs(&instance).await?, format),
+        Command::Volume(VolumeCommand::Path { instance }) => {
+            emit(commands::volume_path(&instance).await?, format)
+        }
+        Command::Psql { cluster, database } => {
+            // Never returns on success — it replaces this process.
+            commands::psql(&cluster, database.as_deref())?;
+            unreachable!("exec replaces the process")
+        }
     }
+
+    Ok(())
+}
+
+fn emit(value: impl CommandOutput, format: OutputFormat) {
+    print!("{}", value.render(format));
 }

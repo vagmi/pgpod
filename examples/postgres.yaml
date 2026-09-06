@@ -1,0 +1,20 @@
+# The stock PostgreSQL image. The defaults suit it, so this is the whole
+# manifest — `postgresUid`/`postgresGid` default to 999, which is what the
+# Debian-based `postgres` images use.
+
+apiVersion: pgpod/v1
+kind: Cluster
+metadata:
+  name: demo
+spec:
+  imageName: docker.io/library/postgres:18
+
+  bootstrap:
+    initdb:
+      database: appdb
+      owner: app
+
+  postgresql:
+    parameters:
+      shared_buffers: 256MB
+      work_mem: 8MB
