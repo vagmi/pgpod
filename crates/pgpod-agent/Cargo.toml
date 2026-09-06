@@ -11,6 +11,16 @@ description = "pgpod instance manager — PID 1 inside the PostgreSQL container"
 name = "pgpod-agent"
 path = "src/main.rs"
 
+# Dependency list is load-bearing: this binary is statically linked against
+# musl and bind-mounted into an arbitrary PostgreSQL image. It must never
+# grow `podman-api`, `rusqlite`, or anything that pulls in OpenSSL
+# (adrs/00-project-setup.md §3).
 [dependencies]
 pgpod-core.workspace = true
+pgpod-pg.workspace = true
 anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+nix = { workspace = true, features = ["user", "fs", "signal", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "time", "sync"] }

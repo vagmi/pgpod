@@ -23,6 +23,17 @@ pub enum Error {
     #[error("volume operation failed: {0}")]
     Volume(String),
 
+    #[error("network operation failed: {0}")]
+    Network(String),
+
+    /// Never carries the underlying podman error text: some failure modes
+    /// echo the request body, which for a secret is the secret.
+    #[error("secret operation failed: {0}")]
+    Secret(String),
+
+    #[error("exec failed: {0}")]
+    Exec(String),
+
     #[error("podman-api: {0}")]
     Podman(#[from] podman_api::Error),
 

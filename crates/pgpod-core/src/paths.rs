@@ -42,6 +42,29 @@ pub mod container {
     /// Directory `postgres` expects its unix socket in. Backed by tmpfs
     /// since the container root filesystem is read-only.
     pub const SOCKET_DIR: &str = "/var/run/postgresql";
+
+    /// UID/GID the PostgreSQL container runs as.
+    ///
+    /// The instance container must run as this user explicitly. The
+    /// official `postgres` images declare no `USER` — they start as root
+    /// and drop privileges inside their entrypoint via `gosu`, and pgpod
+    /// bypasses that entrypoint entirely (ADR 00 §6). Left unset the
+    /// container would run as root, where two things go wrong at once:
+    /// PostgreSQL refuses to start as root, and container-root cannot
+    /// read a 0400 secret owned by another uid because `cap_drop: ALL`
+    /// removed `CAP_DAC_OVERRIDE`.
+    ///
+    /// 999 on Debian-based `postgres` images. CNPG-style images use 26,
+    /// so this is a per-image setting rather than a constant to rely on.
+    pub const DEFAULT_POSTGRES_UID: u32 = 999;
+    pub const DEFAULT_POSTGRES_GID: u32 = 999;
+
+    /// Mounted podman secrets. Passwords reach the container this way and
+    /// never through the environment (ADR 00 §9).
+    pub const SECRET_SUPERUSER: &str = "/run/secrets/pgpod-superuser";
+    pub const SECRET_REPLICATION: &str = "/run/secrets/pgpod-replication";
+    pub const SECRET_MONITOR: &str = "/run/secrets/pgpod-monitor";
+    pub const SECRET_APP_OWNER: &str = "/run/secrets/pgpod-app-owner";
 }
 
 /// Host-side layout for pgpod's own state.

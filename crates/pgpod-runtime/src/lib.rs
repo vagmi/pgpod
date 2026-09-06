@@ -9,14 +9,23 @@
 mod client;
 mod container;
 mod error;
+mod exec;
+mod http;
 mod info;
+mod network;
+mod secret;
 mod socket;
 mod volume;
 
 pub use client::PodmanClient;
-pub use container::{Container, ContainerProbe, ContainerSpec, Mount};
+pub use container::{
+    Container, ContainerProbe, ContainerSpec, Mount, PortPublish, RestartPolicy, SecretMount,
+};
 pub use error::{Error, Result};
+pub use exec::{ExecOutput, ExecSpec};
 pub use info::PodmanInfo;
+pub use network::NetworkInfo;
+pub use secret::SecretInfo;
 pub use socket::{
     ENV_OVERRIDE as PODMAN_SOCKET_ENV, SocketSource, default_socket_path, discover, socket_uri,
 };

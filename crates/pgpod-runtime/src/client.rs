@@ -73,6 +73,24 @@ impl PodmanClient {
             .map_err(|e| Error::Unreachable(e.to_string()))
     }
 
+    /// The raw inspect payload for a container, as JSON.
+    ///
+    /// Exposed for the hardening tests, which must assert what podman
+    /// actually applied rather than what pgpod's own types claim was
+    /// requested — a builder that silently stops mapping to its wire field
+    /// would otherwise go unnoticed (ADR 00 §8). Not for production code
+    /// paths: use the typed accessors.
+    pub async fn inspect_raw(&self, id: &str) -> Result<serde_json::Value> {
+        let containers = self.inner.containers();
+        let data = containers
+            .get(id)
+            .inspect()
+            .await
+            .map_err(|e| Error::Container(format!("inspect {id}: {e}")))?;
+        serde_json::to_value(data)
+            .map_err(|e| Error::Container(format!("serialize inspect payload: {e}")))
+    }
+
     /// Host facts, flattened into pgpod's own type.
     pub async fn info(&self) -> Result<PodmanInfo> {
         let raw = self

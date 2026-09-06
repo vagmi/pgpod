@@ -43,6 +43,61 @@ pub enum Mount {
     Tmpfs { target: String },
 }
 
+/// Where podman materialises mounted secrets. Must be a writable
+/// filesystem before container init, or secret mounting fails — see
+/// [`ContainerSpec::hardened`].
+pub const SECRETS_DIR: &str = "/run/secrets";
+
+/// One host-side port publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortPublish {
+    /// Host interface. Defaults to loopback via [`PortPublish::loopback`]
+    /// — a database should not appear on the LAN because someone forgot a
+    /// flag.
+    pub host_ip: Option<String>,
+    pub host_port: u16,
+    pub container_port: u16,
+}
+
+impl PortPublish {
+    pub fn loopback(host_port: u16, container_port: u16) -> Self {
+        Self {
+            host_ip: Some("127.0.0.1".to_string()),
+            host_port,
+            container_port,
+        }
+    }
+}
+
+/// A podman secret mounted into the container at `target`.
+///
+/// Secrets go here rather than into `env` because environment variables
+/// are visible in `podman inspect`, in `/proc/<pid>/environ`, and in log
+/// lines on error paths (ADR 00 §9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretMount {
+    /// Name of an existing podman secret.
+    pub name: String,
+    /// Absolute path inside the container.
+    pub target: String,
+    /// Octal mode, e.g. `0o400`.
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// What podman should do when the container exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RestartPolicy {
+    /// pgpod's default. The reconciler owns restarts — podman's own
+    /// policy would race it and restart instances the reconciler has
+    /// deliberately fenced (`AGENTS.md` container hardening).
+    #[default]
+    No,
+    OnFailure,
+    Always,
+}
+
 /// What to create a container with.
 #[derive(Debug, Clone)]
 pub struct ContainerSpec {
@@ -64,6 +119,19 @@ pub struct ContainerSpec {
     /// Remove automatically on exit. Right for job containers; wrong for
     /// instances, whose lifetime the reconciler owns.
     pub auto_remove: bool,
+    /// Podman networks to join. Empty uses podman's default.
+    pub networks: Vec<String>,
+    pub port_publishes: Vec<PortPublish>,
+    pub secrets: Vec<SecretMount>,
+    /// Linux capabilities to drop. pgpod passes `["ALL"]`; postgres needs
+    /// none.
+    pub cap_drop: Vec<String>,
+    pub no_new_privileges: bool,
+    /// Read-only container root filesystem. The volume and any tmpfs
+    /// mounts remain writable.
+    pub read_only_fs: bool,
+    pub restart_policy: RestartPolicy,
+    pub hostname: Option<String>,
 }
 
 impl ContainerSpec {
@@ -79,7 +147,94 @@ impl ContainerSpec {
             user: None,
             working_dir: None,
             auto_remove: false,
+            networks: Vec::new(),
+            port_publishes: Vec::new(),
+            secrets: Vec::new(),
+            cap_drop: Vec::new(),
+            no_new_privileges: false,
+            read_only_fs: false,
+            restart_policy: RestartPolicy::No,
+            hostname: None,
         }
+    }
+
+    /// A spec with pgpod's container hardening applied.
+    ///
+    /// This is the shape every PostgreSQL instance and job container gets
+    /// (`AGENTS.md`, "Container hardening"). It is a constructor rather
+    /// than a set of defaults on `new` so that a caller who genuinely
+    /// wants an unhardened container has to say so, and so the hardening
+    /// can be asserted as a unit in tests.
+    pub fn hardened(image: impl Into<String>) -> Self {
+        Self {
+            cap_drop: vec!["ALL".to_string()],
+            no_new_privileges: true,
+            read_only_fs: true,
+            restart_policy: RestartPolicy::No,
+            // A read-only root filesystem means every writable path has
+            // to be an explicit tmpfs. Three are needed, and the third is
+            // not obvious:
+            //
+            // * `/tmp` — scratch.
+            // * the postgres socket directory — the images ship it inside
+            //   the rootfs, which read-only makes unwritable, so postgres
+            //   could not create its socket.
+            // * `/run/secrets` — podman materialises mounted secrets here
+            //   and must *create* each mountpoint. On a read-only rootfs
+            //   that fails during container init with an opaque runc
+            //   error, before anything of ours runs.
+            //
+            // A tmpfs at `/run` does **not** work in its place: runc
+            // creates the secret mountpoints before that mount is
+            // applied. Verified against podman 6.1 — the parent of the
+            // secret targets is what has to be writable.
+            mounts: vec![
+                Mount::Tmpfs {
+                    target: "/tmp".to_string(),
+                },
+                Mount::Tmpfs {
+                    target: SECRETS_DIR.to_string(),
+                },
+                Mount::Tmpfs {
+                    target: pgpod_core::container::SOCKET_DIR.to_string(),
+                },
+            ],
+            ..Self::new(image)
+        }
+    }
+
+    pub fn entrypoint<I, S>(mut self, argv: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.entrypoint = argv.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn network(mut self, name: impl Into<String>) -> Self {
+        self.networks.push(name.into());
+        self
+    }
+
+    pub fn publish(mut self, p: PortPublish) -> Self {
+        self.port_publishes.push(p);
+        self
+    }
+
+    pub fn secret(mut self, s: SecretMount) -> Self {
+        self.secrets.push(s);
+        self
+    }
+
+    pub fn hostname(mut self, name: impl Into<String>) -> Self {
+        self.hostname = Some(name.into());
+        self
+    }
+
+    pub fn env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
+        self.env.push((k.into(), v.into()));
+        self
     }
 
     pub fn name(mut self, name: impl Into<String>) -> Self {
@@ -184,6 +339,76 @@ impl PodmanClient {
         if spec.auto_remove {
             b = b.remove(true);
         }
+        if let Some(h) = &spec.hostname {
+            b = b.hostname(h);
+        }
+        if !spec.cap_drop.is_empty() {
+            b = b.drop_capabilities(spec.cap_drop.clone());
+        }
+        if spec.no_new_privileges {
+            // `podman-api` 0.10 misspells this builder as
+            // `no_new_privilages`. It serializes to the correct wire
+            // field, but a typo'd builder is exactly the kind of thing
+            // that could silently stop applying — `hardening_flags_land`
+            // in tests/hardening.rs asserts it via inspect.
+            b = b.no_new_privilages(true);
+        }
+        if spec.read_only_fs {
+            b = b.read_only_fs(true);
+        }
+        b = b.restart_policy(match spec.restart_policy {
+            RestartPolicy::No => podman_api::opts::ContainerRestartPolicy::No,
+            RestartPolicy::OnFailure => podman_api::opts::ContainerRestartPolicy::OnFailure,
+            RestartPolicy::Always => podman_api::opts::ContainerRestartPolicy::Always,
+        });
+
+        if !spec.networks.is_empty() {
+            let nets: HashMap<String, serde_json::Value> = spec
+                .networks
+                .iter()
+                .map(|n| (n.clone(), serde_json::json!({})))
+                .collect();
+            b = b.networks(nets);
+            // Rootless podman defaults to pasta/slirp4netns, which ignores
+            // the `networks` map entirely — the container would come up
+            // attached to nothing and standbys could not resolve their
+            // primary. Forcing bridge mode is what makes joining a named
+            // network actually work rootless.
+            b = b.net_namespace(podman_api::models::Namespace {
+                nsmode: Some("bridge".to_string()),
+                value: None,
+            });
+        }
+
+        if !spec.port_publishes.is_empty() {
+            let ports: Vec<podman_api::models::PortMapping> = spec
+                .port_publishes
+                .iter()
+                .map(|p| podman_api::models::PortMapping {
+                    container_port: Some(p.container_port),
+                    host_ip: p.host_ip.clone(),
+                    host_port: Some(p.host_port),
+                    protocol: Some("tcp".to_string()),
+                    range: None,
+                })
+                .collect();
+            b = b.portmappings(ports);
+        }
+
+        if !spec.secrets.is_empty() {
+            let secrets: Vec<podman_api::models::Secret> = spec
+                .secrets
+                .iter()
+                .map(|s| podman_api::models::Secret {
+                    source: Some(s.name.clone()),
+                    target: Some(s.target.clone()),
+                    mode: Some(s.mode),
+                    uid: Some(s.uid),
+                    gid: Some(s.gid),
+                })
+                .collect();
+            b = b.secrets(secrets);
+        }
 
         // Named volumes and bind mounts go through different fields of the
         // libpod create payload: `volumes` for named volumes, `mounts` for
@@ -234,15 +459,55 @@ impl PodmanClient {
             b = b.mounts(oci_mounts);
         }
 
-        let created = self
-            .podman()
-            .containers()
-            .create(&b.build())
-            .await
-            .map_err(|e| Error::Container(format!("create: {e}")))?;
+        // podman-api builds the payload; we post it ourselves so the one
+        // key its builder misspells actually lands. See `http.rs` for why
+        // this detour exists and why it must not grow.
+        let opts = b.build();
+        let payload = opts
+            .serialize()
+            .map_err(|e| Error::Container(format!("serialize create options: {e}")))?;
+        let mut json: serde_json::Value = serde_json::from_str(&payload)
+            .map_err(|e| Error::Container(format!("re-parse create options: {e}")))?;
+
+        if spec.no_new_privileges {
+            let obj = json
+                .as_object_mut()
+                .ok_or_else(|| Error::Container("create payload is not an object".into()))?;
+            // Drop the typo'd key so podman is not left with a stray
+            // unknown field, then set the one it actually reads.
+            obj.remove("no_new_privilages");
+            obj.insert(
+                "no_new_privileges".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            json = serde_json::Value::Object(obj.clone());
+        }
+
+        let body = json.to_string();
+        let (status, response) = crate::http::post_json(
+            self.socket_path(),
+            "/v4.0.0/libpod/containers/create",
+            &body,
+        )
+        .await?;
+
+        if !(200..300).contains(&status) {
+            return Err(Error::Container(format!(
+                "create returned HTTP {status}: {}",
+                response.trim()
+            )));
+        }
+
+        let created: serde_json::Value = serde_json::from_str(&response)
+            .map_err(|e| Error::Container(format!("parse create response: {e}: {response}")))?;
+        let id = created
+            .get("Id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Container(format!("create response had no Id: {response}")))?
+            .to_string();
 
         Ok(Container {
-            id: created.id,
+            id,
             client: self.clone(),
         })
     }
@@ -260,6 +525,12 @@ impl PodmanClient {
 impl Container {
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The client that owns this container. `pub(crate)` so the podman
+    /// handle stays inside this crate (ADR 00 §1).
+    pub(crate) fn client_ref(&self) -> &PodmanClient {
+        &self.client
     }
 
     pub async fn start(&self) -> Result<()> {

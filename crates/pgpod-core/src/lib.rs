@@ -8,7 +8,11 @@
 mod ids;
 mod lifecycle;
 mod paths;
+mod secret;
+mod spec;
 
 pub use ids::{ClusterId, InstanceId, ParseInstanceIdError};
 pub use lifecycle::{InstancePhase, InstanceRole, ParsePhaseError, ParseRoleError};
 pub use paths::{PathLayout, container};
+pub use secret::Secret;
+pub use spec::{Bootstrap, InitdbBootstrap, InstanceSpec, SPEC_ENV, SpecError};
