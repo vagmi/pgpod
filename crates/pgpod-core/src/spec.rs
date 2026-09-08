@@ -77,6 +77,7 @@ pub struct RecoveryBootstrap {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InitdbBootstrap {
     /// Application database to create. `None` creates none.
     pub database: Option<String>,

@@ -1,8 +1,9 @@
 # A cluster that backs up to a local podman volume, through pgBackRest.
 #
 # The fast loop: no network, no credentials, and the whole PITR path —
-# archive, base backup, restore --at — exercised end to end. It is what
-# `crates/pgpod-control/tests/pitr.rs` runs.
+# archive, base backup, restore --at — exercised end to end. The same
+# shape `crates/pgpod-control/tests/pitr.rs` builds, and verified by hand
+# on Ubuntu 26.04 with podman 5.7.
 #
 #   ops/build-agent.sh
 #   ops/build-pgbackrest.sh
@@ -50,3 +51,7 @@ spec:
     # accepted and `48h` is refused rather than rounded.
     retention: 14d
     retentionMode: report
+
+# For a real deployment use an object store instead — see
+# examples/backup-gcs.yaml. A repository on the same machine as the
+# database survives a lost container, not a lost machine.

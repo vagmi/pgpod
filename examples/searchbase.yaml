@@ -41,3 +41,17 @@ spec:
   postgresql:
     sharedPreloadLibraries:
       - pg_textsearch
+
+  # Backups work on this image with no changes to it. pgBackRest is
+  # dynamically linked, so it cannot be shipped the way pgpod's static
+  # agent is — instead `ops/build-pgbackrest.sh` bundles the binary with
+  # its libraries and loader and patches the ELF to find them, and pgpod
+  # bind-mounts that read-only. Nothing from the surrounding image is
+  # used, so it runs here (Debian 12, uid 26) exactly as it does on the
+  # stock image (ADR 04 §2).
+  #
+  # Verified end to end on this image: apply, backup, restore --at.
+  backup:
+    volume: pgpod-search-archive
+    destinations:
+      - url: file:///archive/search

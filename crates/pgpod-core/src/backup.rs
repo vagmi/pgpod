@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 /// One object-storage destination.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Destination {
     /// `gs://bucket/prefix`, `s3://bucket/prefix`, or `file:///path`.
     ///
@@ -145,6 +146,7 @@ impl Destination {
 /// `spec.backup` in the cluster manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct BackupSpec {
     /// Every destination receives every object. An archive that succeeded
     /// on only some of them is not independently restorable from any of

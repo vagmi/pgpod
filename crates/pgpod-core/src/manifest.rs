@@ -11,8 +11,22 @@ use crate::{BackupSpec, ClusterId, InitdbBootstrap, ParseInstanceIdError};
 pub const API_VERSION: &str = "pgpod/v1";
 pub const KIND: &str = "Cluster";
 
+// Every type below rejects unknown fields.
+//
+// A manifest is written by hand, and serde's default is to ignore what it
+// does not recognise — so `scheduel: "0 2 * * *"`, or a field pgpod has
+// not implemented yet, parses cleanly and does nothing. The operator is
+// then told their cluster was applied successfully and believes they have
+// something they do not. That is the same failure shape as silently
+// truncating `instances: 3`, which this file already refuses.
+//
+// The cost is forward compatibility: an older pgpod rejects a manifest
+// written for a newer one. That is the right way round — better to refuse
+// a file you cannot honour than to honour half of it.
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ClusterManifest {
     pub api_version: String,
     pub kind: String,
@@ -21,12 +35,14 @@ pub struct ClusterManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Metadata {
     pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ClusterSpec {
     #[serde(default = "default_instances")]
     pub instances: u32,
@@ -60,6 +76,7 @@ pub struct ClusterSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct BootstrapSpec {
     #[serde(default)]
     pub initdb: InitdbBootstrap,
@@ -67,6 +84,7 @@ pub struct BootstrapSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct PostgresqlSpec {
     /// Tuning knobs. Rejected if they name a setting pgpod manages —
     /// see `pgpod_pg::RESERVED_PARAMETERS`.
@@ -78,6 +96,7 @@ pub struct PostgresqlSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct StorageSpec {
     /// **Advisory.** A podman volume has no quota unless the graph root is
     /// XFS with project quotas, and pgpod does not yet set one even there.

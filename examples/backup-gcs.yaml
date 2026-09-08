@@ -6,18 +6,28 @@
 # a container superuser reading object-store credentials — there are none
 # to read.
 #
-# Off GCE, create a podman secret holding the pgBackRest repository
-# options this destination needs, without their `repoN-` prefix, and name
-# it in `credentials`:
+# Off GCE you supply a key. `credentials` names a **podman secret** whose
+# contents are `KEY=value` lines using pgBackRest's repository option
+# names *without* their `repoN-` prefix — pgpod adds the index, so you
+# never have to know which repository number your destination became:
 #
-#   printf 'gcs-key-type=service\ngcs-key=/run/secrets/...\n' \
-#     | podman secret create pgpod-demo-gcs -
+#   podman secret create pgpod-demo-gcs - <<'EOF'
+#   gcs-key-type=token
+#   gcs-key=ya29.your-oauth-token
+#   EOF
 #
-# pgpod mounts it at /run/secrets/pgpod-store-<index> and renders the
-# options under the right repository index, so an operator never has to
-# know which number their destination became. The secret's *name* never
-# reaches the instance spec, which travels in an environment variable
-# `podman inspect` prints.
+# pgpod mounts it at /run/secrets/pgpod-store-<index> and renders those
+# options into pgbackrest.conf at 0600. The secret's *name* never reaches
+# the instance spec, which travels in an environment variable that
+# `podman inspect` prints (ADR 00 §9) — and pgBackRest refuses secrets on
+# its command line for the same reason.
+#
+# For a service-account JSON file, pgBackRest's `gcs-key` wants a *path*
+# inside the container, so mount the file as its own podman secret and
+# point at it:
+#
+#   gcs-key-type=service
+#   gcs-key=/run/secrets/pgpod-demo-gcs-key
 apiVersion: pgpod/v1
 kind: Cluster
 metadata:
@@ -31,6 +41,8 @@ spec:
       owner: app
 
   backup:
+    # No `volume:` here — that is only for a local file:// repository.
+    # A cloud repository is reached over the network.
     destinations:
       # Bucket plus an optional prefix. The cluster name is always appended
       # by pgpod, so several clusters can share one bucket without
@@ -59,3 +71,9 @@ spec:
     # configures no retention at all, so pgBackRest keeps everything: a
     # tool that silently deletes backups has to earn that trust first.
     retentionMode: report
+
+# Not supported yet, and deliberately absent rather than ignored: pgpod
+# rejects unknown manifest fields, so a `schedule:` here would fail at
+# `apply` rather than silently never running. Scheduled backups arrive
+# with the daemon in Phase 4 (ROADMAP.md); until then `pgpod backup` is
+# something you run, or put in a systemd timer.
