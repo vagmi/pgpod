@@ -132,6 +132,12 @@ impl Pgpod {
     /// Distinct from [`Pgpod::running_container`]: `pgpod logs` must work
     /// on a container that has exited, which is exactly when its logs
     /// matter most.
+    /// The podman client, for tests and embedders that need to reach
+    /// something pgpod does not model — an archive volume, for instance.
+    pub fn podman_client(&self) -> &pgpod_runtime::PodmanClient {
+        self.podman()
+    }
+
     pub fn podman_container(&self, instance: &pgpod_core::InstanceId) -> pgpod_runtime::Container {
         self.podman().container(instance.container_name())
     }

@@ -76,6 +76,46 @@ enum Command {
     #[command(subcommand)]
     Volume(VolumeCommand),
 
+    /// Take a base backup and ship it to the cluster's destinations.
+    Backup {
+        cluster: String,
+        /// Seconds to wait for the backup to finish. `0` starts the job
+        /// and returns.
+        #[arg(long, default_value_t = 3600)]
+        wait: u64,
+    },
+
+    /// List the backups that are actually restorable.
+    Backups { cluster: String },
+
+    /// Restore a cluster from its archive into a new one.
+    Restore {
+        /// Cluster to restore *from*.
+        cluster: String,
+        /// Name for the restored cluster. Must not already exist.
+        #[arg(long = "as")]
+        target: String,
+        /// Point in time to recover to, RFC 3339, e.g.
+        /// `2026-09-04T10:00:00Z`. Omit to replay everything available.
+        #[arg(long)]
+        at: Option<String>,
+        #[arg(long, default_value_t = 1800)]
+        wait: u64,
+    },
+
+    /// Fork a cluster: restore it as of now, under a new name.
+    Fork {
+        cluster: String,
+        #[arg(long = "as")]
+        target: String,
+        /// Point in time, RFC 3339. Defaults to now — i.e. everything the
+        /// archive has.
+        #[arg(long)]
+        at: Option<String>,
+        #[arg(long, default_value_t = 1800)]
+        wait: u64,
+    },
+
     /// Remove a cluster's containers. Volumes are kept unless --purge.
     Delete {
         cluster: String,
@@ -118,6 +158,29 @@ async fn main() -> Result<()> {
         }
         Command::Apply { file, wait } => emit(commands::apply(&file, wait).await?, format),
         Command::Status { cluster } => emit(commands::status(cluster).await?, format),
+        Command::Backup { cluster, wait } => {
+            emit(commands::backup(&cluster, wait).await?, format)
+        }
+        Command::Backups { cluster } => emit(commands::backups(&cluster).await?, format),
+        Command::Restore {
+            cluster,
+            target,
+            at,
+            wait,
+        }
+        // `fork` is `restore` with the target defaulting to now — paagan's
+        // fork command, generalized from a local directory to object
+        // storage (ADR 01 §5). One implementation, two names, because the
+        // second name is what people reach for.
+        | Command::Fork {
+            cluster,
+            target,
+            at,
+            wait,
+        } => emit(
+            commands::restore(&cluster, &target, at.as_deref(), wait).await?,
+            format,
+        ),
         Command::Delete { cluster, purge } => {
             emit(commands::delete(&cluster, purge).await?, format)
         }

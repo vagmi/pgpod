@@ -16,7 +16,7 @@ mod roles;
 
 pub use conf::{
     ArchiveMode, INCLUDE_DIR_LINE, MANAGED_CONF_FILE, ManagedConf, RESERVED_PARAMETERS,
-    StandbyConf, USER_CONF_FILE, render_user_conf,
+    RecoveryConf, StandbyConf, USER_CONF_FILE, archive_command, render_user_conf, restore_command,
 };
 pub use hba::{AuthMethod, HbaConfig};
 pub use initdb::{InitdbOptions, PWFILE_PATH};

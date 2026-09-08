@@ -281,6 +281,23 @@ pub struct ContainerProbe {
     pub running: bool,
     pub status: Option<String>,
     pub exit_code: Option<i32>,
+    /// The container's environment, as podman reports it: `KEY=value`.
+    ///
+    /// Carried because the instance spec travels in one of these
+    /// (`pgpod_core::SPEC_ENV`) and is fixed at *container-create* time.
+    /// Reading it back is how the reconciler learns that a running
+    /// container is enacting an older manifest than the one just applied.
+    pub env: Vec<String>,
+}
+
+impl ContainerProbe {
+    /// The value of one environment variable, if the container has it.
+    pub fn env_var(&self, key: &str) -> Option<&str> {
+        let prefix = format!("{key}=");
+        self.env
+            .iter()
+            .find_map(|e| e.strip_prefix(prefix.as_str()))
+    }
 }
 
 impl PodmanClient {
@@ -569,12 +586,18 @@ impl Container {
             .await
             .map_err(|e| Error::Container(format!("inspect {}: {e}", self.id)))?;
         let state = data.state;
+        let env = data
+            .config
+            .as_ref()
+            .and_then(|c| c.env.clone())
+            .unwrap_or_default();
         Ok(Some(ContainerProbe {
             id: data.id.unwrap_or_else(|| self.id.clone()),
             name: data.name,
             running: state.as_ref().and_then(|s| s.running).unwrap_or(false),
             status: state.as_ref().and_then(|s| s.status.clone()),
             exit_code: state.as_ref().and_then(|s| s.exit_code),
+            env,
         }))
     }
 

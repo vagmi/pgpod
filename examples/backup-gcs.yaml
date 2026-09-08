@@ -1,0 +1,61 @@
+# A cluster that archives to Google Cloud Storage.
+#
+# On GCE this needs **no credentials at all**: pgpod renders
+# `repo1-gcs-key-type=auto`, and pgBackRest then authorizes with the
+# instance service account. That also removes the ADR 00 §9 concern about
+# a container superuser reading object-store credentials — there are none
+# to read.
+#
+# Off GCE, create a podman secret holding the pgBackRest repository
+# options this destination needs, without their `repoN-` prefix, and name
+# it in `credentials`:
+#
+#   printf 'gcs-key-type=service\ngcs-key=/run/secrets/...\n' \
+#     | podman secret create pgpod-demo-gcs -
+#
+# pgpod mounts it at /run/secrets/pgpod-store-<index> and renders the
+# options under the right repository index, so an operator never has to
+# know which number their destination became. The secret's *name* never
+# reaches the instance spec, which travels in an environment variable
+# `podman inspect` prints.
+apiVersion: pgpod/v1
+kind: Cluster
+metadata:
+  name: demo-gcs
+spec:
+  imageName: docker.io/library/postgres:18
+
+  bootstrap:
+    initdb:
+      database: appdb
+      owner: app
+
+  backup:
+    destinations:
+      # Bucket plus an optional prefix. The cluster name is always appended
+      # by pgpod, so several clusters can share one bucket without
+      # colliding: this becomes gs://pgpod-backups/prod/demo-gcs/...
+      - url: gs://pgpod-backups/prod
+
+      # A second destination becomes repo2. pgBackRest documents that
+      # archive-push "will attempt to push to as many repositories as
+      # possible", which is not obviously the fail-unless-all semantics
+      # ADR 01 §7 argued for — confirm what the exit status actually is
+      # before relying on either (ADR 04 §7). At most four.
+      #
+      # - url: s3://mirror/pgpod
+      #   endpoint: garage.internal:3900   # host and port, never a URL
+      #   region: garage                   # Garage's default, not us-east-1
+      #   verifyTls: false                 # accepts a self-signed cert
+      #   credentials: pgpod-demo-s3
+      #
+      # pgBackRest always speaks TLS to object storage — there is no
+      # plaintext option — so `verifyTls: false` is as far as an insecure
+      # local fixture can go.
+
+    # Whole days only — pgBackRest's time-based retention counts them.
+    retention: 14d
+    # Change to `enforce` to actually delete. Under `report` pgpod
+    # configures no retention at all, so pgBackRest keeps everything: a
+    # tool that silently deletes backups has to earn that trust first.
+    retentionMode: report

@@ -61,6 +61,38 @@ pub const RESERVED_PARAMETERS: &[&str] = &[
     "wal_log_hints",
 ];
 
+/// `archive_command`, as PostgreSQL will run it.
+///
+/// Points at pgBackRest **directly**, not at a pgpod shim that shells out
+/// to it (ADR 04 §1). A wrapper process on the archive path buys nothing
+/// and adds a failure mode in the one place where a wrong exit status is a
+/// silent data-loss bug.
+///
+/// Absolute paths throughout, because `archive_command` runs through the
+/// shell with the postmaster's `PATH` — which belongs to the image and
+/// varies between image families. `--config` is explicit for the same
+/// reason: nothing here should depend on a search order pgpod does not
+/// control.
+pub fn archive_command(stanza: &str) -> String {
+    format!(
+        "{} --config={} --stanza={stanza} archive-push %p",
+        pgpod_core::container::PGBACKREST_BIN,
+        pgpod_core::container::PGBACKREST_CONF,
+    )
+}
+
+/// `restore_command`, as PostgreSQL will run it.
+///
+/// `%p` is quoted because PostgreSQL substitutes a path that, while it has
+/// never contained a space in practice, is not pgpod's to guarantee.
+pub fn restore_command(stanza: &str) -> String {
+    format!(
+        "{} --config={} --stanza={stanza} archive-get %f \"%p\"",
+        pgpod_core::container::PGBACKREST_BIN,
+        pgpod_core::container::PGBACKREST_CONF,
+    )
+}
+
 /// WAL archiving state for an instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArchiveMode {
@@ -88,6 +120,21 @@ pub struct ManagedConf {
     pub shared_preload_libraries: Vec<String>,
     /// Rendered on a standby; `None` on a primary.
     pub standby: Option<StandbyConf>,
+    /// Rendered while an instance is recovering from the archive; `None`
+    /// otherwise.
+    pub recovery: Option<RecoveryConf>,
+}
+
+/// Settings that only apply while an instance is replaying the archive.
+#[derive(Debug, Clone)]
+pub struct RecoveryConf {
+    /// How to fetch a segment. Points at the *source* cluster's archive,
+    /// which is not the same as where this instance will archive once it
+    /// is promoted (ADR 01 §5).
+    pub restore_command: String,
+    /// `recovery_target_time`, RFC 3339. `None` replays everything
+    /// available.
+    pub target_time: Option<String>,
 }
 
 /// Settings that only apply while an instance is following another.
@@ -107,7 +154,13 @@ impl ManagedConf {
             archive: ArchiveMode::Off,
             shared_preload_libraries: Vec::new(),
             standby: None,
+            recovery: None,
         }
+    }
+
+    pub fn with_recovery(mut self, recovery: Option<RecoveryConf>) -> Self {
+        self.recovery = recovery;
+        self
     }
 
     pub fn with_archive(mut self, archive: ArchiveMode) -> Self {
@@ -179,6 +232,36 @@ impl ManagedConf {
                 "shared_preload_libraries",
                 quote(&self.shared_preload_libraries.join(",")),
             );
+        }
+
+        if let Some(recovery) = &self.recovery {
+            out.push_str("\n# --- recovery ---\n");
+            push(
+                &mut out,
+                "restore_command",
+                quote(&recovery.restore_command),
+            );
+            match &recovery.target_time {
+                Some(t) => {
+                    push(&mut out, "recovery_target_time", quote(t));
+                    // Without this PostgreSQL pauses at the target and
+                    // waits for an operator, which for pgpod means an
+                    // instance that never becomes ready and a `restore`
+                    // that appears to hang (ADR 01 §5 step 4).
+                    push(&mut out, "recovery_target_action", quote("promote"));
+                    // Never `latest`: after a promote the archive holds
+                    // more than one timeline, and following the newest one
+                    // would replay history the operator did not ask for.
+                    push(&mut out, "recovery_target_timeline", quote("current"));
+                }
+                None => {
+                    out.push_str(
+                        "# No recovery target: replay everything the archive has, then\n\
+                         # promote. This is what `pgpod fork` asks for.\n",
+                    );
+                    push(&mut out, "recovery_target_timeline", quote("current"));
+                }
+            }
         }
 
         if let Some(standby) = &self.standby {

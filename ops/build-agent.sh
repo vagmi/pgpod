@@ -38,6 +38,11 @@ DEST="$DEST_DIR/pgpod-agent-$ARCH"
 echo "== ensuring the $TARGET toolchain is present"
 rustup target add "$TARGET" >/dev/null
 
+# No features: object-store backends were cargo features while pgpod
+# implemented archiving itself. pgBackRest carries posix, s3, gcs, azure
+# and sftp in one binary, so the agent no longer links any of it — and the
+# musl build lost `object_store`, `zstd`, `sha2` and a whole TLS stack with
+# them (ADR 04).
 echo "== building pgpod-agent for $TARGET"
 cargo build -p pgpod-agent --target "$TARGET" --release
 

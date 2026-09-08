@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use pgpod_control::{ApplyReport, ClusterStatus, DeleteReport, Pgpod};
+use pgpod_control::{ApplyReport, BackupReport, ClusterStatus, DeleteReport, Pgpod, RestoreReport};
 use pgpod_core::{ClusterId, ClusterManifest, InstanceId};
 use pgpod_runtime::ExecSpec;
 use serde::Serialize;
@@ -43,6 +43,170 @@ pub async fn apply(path: &str, wait_secs: u64) -> Result<ApplyReport> {
     let pgpod = Pgpod::open()?;
     Ok(pgpod
         .apply(&manifest, Duration::from_secs(wait_secs))
+        .await?)
+}
+
+// ---- backup ---------------------------------------------------------
+
+impl CommandOutput for BackupReport {
+    fn to_text(&self) -> String {
+        let mut out = format!("backup of cluster '{}'\n", self.cluster);
+        for d in &self.destinations {
+            out.push_str(&format!("  destination:  {d}\n"));
+        }
+        match (&self.label, &self.backup_type) {
+            (Some(label), kind) => {
+                out.push_str(&format!("\n  label:        {label}\n"));
+                if let Some(k) = kind {
+                    // pgBackRest decides full/diff/incr from what the
+                    // repository already holds — worth showing, because an
+                    // operator asking for "a backup" gets whichever is
+                    // cheapest and should know which they got.
+                    out.push_str(&format!("  type:         {k}\n"));
+                }
+                if let Some(size) = self.size_bytes {
+                    out.push_str(&format!("  database:     {size} bytes\n"));
+                }
+                out.push_str("\nComplete — pgbackrest recorded it, so it is restorable.\n");
+            }
+            (None, _) => out.push_str(
+                "\nThe job finished but the repository shows no new backup. \
+                 Check `pgpod backups`.\n",
+            ),
+        }
+        out
+    }
+}
+
+pub async fn backup(cluster: &str, wait_secs: u64) -> Result<BackupReport> {
+    let id = ClusterId::new(cluster.to_string())?;
+    let pgpod = Pgpod::open()?;
+    Ok(pgpod.backup(&id, Duration::from_secs(wait_secs)).await?)
+}
+
+/// The backups pgBackRest holds, oldest first.
+#[derive(Serialize)]
+pub struct BackupList {
+    pub cluster: String,
+    pub backups: Vec<BackupSummary>,
+}
+
+/// Flattened for output. pgBackRest's own JSON is richer than anything
+/// `pgpod backups` should print, and `-o json` should be pgpod's shape
+/// rather than a passthrough that changes with pgBackRest's version.
+#[derive(Serialize)]
+pub struct BackupSummary {
+    pub label: String,
+    pub backup_type: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub size_bytes: u64,
+    pub wal_start: Option<String>,
+    pub wal_stop: Option<String>,
+}
+
+impl CommandOutput for BackupList {
+    fn to_text(&self) -> String {
+        if self.backups.is_empty() {
+            return format!(
+                "cluster '{}' has no backups.\n\nTake one with:  pgpod backup {}\n",
+                self.cluster, self.cluster
+            );
+        }
+        let mut out = format!("backups of cluster '{}':\n\n", self.cluster);
+        for b in &self.backups {
+            out.push_str(&format!(
+                "  {:<34}  {:<5}  {:>12} bytes  ended {}\n",
+                b.label, b.backup_type, b.size_bytes, b.ended_at
+            ));
+        }
+        if let (Some(first), Some(last)) = (self.backups.first(), self.backups.last()) {
+            // The window a PITR target can land in. Saying it here saves
+            // an error later.
+            out.push_str(&format!(
+                "\nRestorable from {} onwards (newest backup ended {}).\n",
+                first.ended_at, last.ended_at
+            ));
+        }
+        out
+    }
+}
+
+pub async fn backups(cluster: &str) -> Result<BackupList> {
+    let id = ClusterId::new(cluster.to_string())?;
+    let pgpod = Pgpod::open()?;
+    let backups = pgpod
+        .backups(&id)
+        .await?
+        .into_iter()
+        .map(|b| BackupSummary {
+            label: b.label.clone(),
+            backup_type: format!("{:?}", b.backup_type).to_lowercase(),
+            started_at: b.started_at().format("%Y-%m-%d %H:%M:%SZ").to_string(),
+            ended_at: b.ended_at().format("%Y-%m-%d %H:%M:%SZ").to_string(),
+            size_bytes: b.size_bytes(),
+            wal_start: b.archive.as_ref().and_then(|a| a.start.clone()),
+            wal_stop: b.archive.as_ref().and_then(|a| a.stop.clone()),
+        })
+        .collect();
+    Ok(BackupList {
+        cluster: cluster.to_string(),
+        backups,
+    })
+}
+
+// ---- restore --------------------------------------------------------
+
+impl CommandOutput for RestoreReport {
+    fn to_text(&self) -> String {
+        let mut out = format!(
+            "restored '{}' into cluster '{}'\n  from backup:  {}\n",
+            self.source_cluster, self.target_cluster, self.backup_label
+        );
+        match &self.target_time {
+            Some(t) => out.push_str(&format!("  target time:  {t}\n")),
+            None => out.push_str("  target time:  (replay everything available)\n"),
+        }
+        for i in &self.instances {
+            out.push_str(&format!(
+                "\n  {}  container {}  volume {}\n    {}\n",
+                i.instance, i.container, i.volume, i.connection_uri
+            ));
+        }
+        out.push_str(&format!(
+            "\nConnect with:  pgpod psql {}\n",
+            self.target_cluster
+        ));
+        out
+    }
+}
+
+pub async fn restore(
+    source: &str,
+    target: &str,
+    at: Option<&str>,
+    wait_secs: u64,
+) -> Result<RestoreReport> {
+    let source_id = ClusterId::new(source.to_string())?;
+    let target_id = ClusterId::new(target.to_string())?;
+
+    let at = match at {
+        None => None,
+        Some(raw) => Some(
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .with_context(|| {
+                    format!(
+                        "{raw:?} is not an RFC 3339 timestamp — try \
+                         2026-09-04T10:00:00Z"
+                    )
+                })?,
+        ),
+    };
+
+    let pgpod = Pgpod::open()?;
+    Ok(pgpod
+        .restore(&source_id, &target_id, at, Duration::from_secs(wait_secs))
         .await?)
 }
 

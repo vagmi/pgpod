@@ -28,9 +28,50 @@ pub mod container {
     /// Agent-rendered configuration and the replication passfile.
     pub const CONF_DIR: &str = "/pgdata/conf";
 
-    /// WAL prefetch staging. A sibling of `pgdata/` on the same filesystem
-    /// so `restore_command` delivery is a rename, not a copy (ADR 01 §5).
+    /// pgBackRest's spool directory. A sibling of `pgdata/` on the same
+    /// filesystem, which is what lets pgBackRest deliver a restored
+    /// segment by renaming rather than copying it.
     pub const SPOOL_DIR: &str = "/pgdata/spool";
+
+    /// pgBackRest's log directory.
+    ///
+    /// Inside the volume because the container rootfs is read-only, so
+    /// pgBackRest's default `/var/log/pgbackrest` is not writable
+    /// (ADR 04 §3). File logging is switched *off* in the rendered config
+    /// — output goes to the container stream with everything else — but
+    /// pgBackRest still wants a valid path.
+    pub const LOG_DIR: &str = "/pgdata/log";
+
+    /// Where the pgBackRest bundle is mounted, read-only.
+    ///
+    /// A directory rather than the agent's single file, because pgBackRest
+    /// is dynamically linked and travels with its own libraries and loader
+    /// (ADR 04 §2). Outside the volume: it belongs to the host
+    /// installation, not to this instance's data, and it is the same
+    /// bundle for every cluster.
+    pub const PGBACKREST_BUNDLE: &str = "/opt/pgpod";
+
+    /// The wrapper that invokes the bundled loader. Everything calls this
+    /// rather than spelling out the loader invocation.
+    pub const PGBACKREST_BIN: &str = "/opt/pgpod/bin/pgbackrest";
+
+    /// The CA certificate store shipped in the pgBackRest bundle.
+    ///
+    /// OpenSSL opens its trust store by path at *runtime*, so it is
+    /// invisible to `ldd` and the bundle missed it at first. Without it,
+    /// TLS verification depends on the target image happening to carry
+    /// certificates — which the stock `postgres:18` and Alpine images do
+    /// not, so an S3 or GCS repository fails with "unable to get local
+    /// issuer certificate" while a posix one works perfectly (ADR 04 §2).
+    pub const PGBACKREST_CA_FILE: &str = "/opt/pgpod/share/ca-bundle.crt";
+
+    /// The agent-rendered pgBackRest configuration.
+    ///
+    /// Inside the volume rather than at pgBackRest's default
+    /// `/etc/pgbackrest/pgbackrest.conf`, which a read-only rootfs makes
+    /// unwritable (ADR 04 §3). Every invocation passes `--config` at this
+    /// path, so nothing depends on pgBackRest's search order.
+    pub const PGBACKREST_CONF: &str = "/pgdata/conf/pgbackrest.conf";
 
     /// The agent's status socket, which the daemon reads instead of
     /// opening a SQL connection per probe (ADR 02 §7).
@@ -56,6 +97,26 @@ pub mod container {
     /// this the same way, with its own `/controller/run`.
     pub const SOCKET_DIR: &str = "/pgdata/run";
 
+    /// The port PostgreSQL serves on inside the container.
+    pub const PG_PORT: u16 = 5432;
+
+    /// Port the *bootstrap* postmaster listens on, and nothing else.
+    ///
+    /// The bootstrap window — where `initdb`'s roles are created and the
+    /// pgBackRest stanza is made — is supposed to be private: the comment
+    /// on `with_local_postgres` says an outside client must not see a
+    /// half-created role set. `listen_addresses=''` closed TCP but not the
+    /// unix socket, and a unix socket's *filename* encodes the port
+    /// (`.s.PGSQL.<port>`), so a different port here is what actually
+    /// makes the window private.
+    ///
+    /// It also fixes a race that was real rather than theoretical:
+    /// `pgpod apply --wait` probes readiness with `pg_isready` on the
+    /// standard port, which the bootstrap postmaster was answering. Apply
+    /// could therefore return "ready" and the caller's first connection
+    /// would land on a server already shutting down.
+    pub const BOOTSTRAP_PORT: u16 = 5433;
+
     /// UID/GID the PostgreSQL container runs as.
     ///
     /// The instance container must run as this user explicitly. The
@@ -71,6 +132,22 @@ pub mod container {
     /// so this is a per-image setting rather than a constant to rely on.
     pub const DEFAULT_POSTGRES_UID: u32 = 999;
     pub const DEFAULT_POSTGRES_GID: u32 = 999;
+
+    /// Where `spec.backup.volume` is mounted, when a cluster archives to
+    /// a `file://` destination.
+    ///
+    /// Deliberately **not** under [`VOLUME_MOUNT`]: the archive must
+    /// outlive the data directory it protects, and putting it inside the
+    /// instance's own volume would mean `pgpod delete --purge` destroys
+    /// the backups along with the database it was taking them for.
+    ///
+    /// A named volume rather than a host bind mount because that is the
+    /// one thing that works without UID mapping tricks: podman chowns an
+    /// empty named volume to the container's user on first mount, which
+    /// Phase 0 verified rather than assumed (ADR 00 §4). A host directory
+    /// would land in the user namespace owned by the wrong uid, which is
+    /// precisely the failure the volume storage model exists to avoid.
+    pub const ARCHIVE_MOUNT: &str = "/archive";
 
     /// Mounted podman secrets. Passwords reach the container this way and
     /// never through the environment (ADR 00 §9).
@@ -184,6 +261,21 @@ impl PathLayout {
         self.agent_binary(std::env::consts::ARCH)
     }
 
+    /// The pgBackRest bundle for `arch`, bind-mounted into every container
+    /// that touches the repository.
+    ///
+    /// Per-architecture for the same reason the agent is: it contains
+    /// native code, and mounting the wrong one fails at exec time with a
+    /// message about a file that plainly exists (ADR 00 §3).
+    pub fn pgbackrest_bundle(&self, arch: &str) -> PathBuf {
+        self.data_dir.join(format!("pgbackrest-{arch}"))
+    }
+
+    /// The pgBackRest bundle matching the architecture pgpod is running on.
+    pub fn pgbackrest_bundle_for_host(&self) -> PathBuf {
+        self.pgbackrest_bundle(std::env::consts::ARCH)
+    }
+
     /// Per-cluster runtime directory, holding endpoint sockets.
     pub fn cluster_runtime_dir(&self, cluster: &crate::ClusterId) -> PathBuf {
         self.runtime_dir.join(cluster.as_str())
@@ -237,6 +329,30 @@ mod tests {
     }
 
     #[test]
+    fn the_pgbackrest_bundle_is_per_architecture() {
+        // It carries native code and its own loader; mounting an x86_64
+        // bundle into an aarch64 container fails at exec.
+        let l = layout();
+        assert_eq!(
+            l.pgbackrest_bundle("x86_64"),
+            PathBuf::from("/data/pgbackrest-x86_64")
+        );
+        assert_ne!(
+            l.pgbackrest_bundle("x86_64"),
+            l.pgbackrest_bundle("aarch64")
+        );
+    }
+
+    #[test]
+    fn the_pgbackrest_bundle_is_mounted_outside_the_volume() {
+        // It belongs to the host installation and is shared by every
+        // cluster, so it must not live inside one instance's data — where
+        // `delete --purge` would take it.
+        assert!(!container::PGBACKREST_BUNDLE.starts_with(container::VOLUME_MOUNT));
+        assert!(container::PGBACKREST_BIN.starts_with(container::PGBACKREST_BUNDLE));
+    }
+
+    #[test]
     fn container_paths_nest_under_the_volume_mount() {
         // The agent and the daemon both hardcode these; if they ever
         // disagree the instance writes its config where postgres will not
@@ -244,7 +360,9 @@ mod tests {
         assert!(container::PGDATA.starts_with(container::VOLUME_MOUNT));
         assert!(container::CONF_DIR.starts_with(container::VOLUME_MOUNT));
         assert!(container::SPOOL_DIR.starts_with(container::VOLUME_MOUNT));
+        assert!(container::LOG_DIR.starts_with(container::VOLUME_MOUNT));
         assert!(container::STATUS_SOCKET.starts_with(container::CONF_DIR));
+        assert!(container::PGBACKREST_CONF.starts_with(container::CONF_DIR));
     }
 
     #[test]

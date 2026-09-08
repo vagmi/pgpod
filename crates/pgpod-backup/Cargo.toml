@@ -1,0 +1,21 @@
+[package]
+name = "pgpod-backup"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "pgBackRest integration for pgpod: configuration, invocation, and repository queries"
+
+# No cargo features. Backends were features when pgpod implemented object
+# storage itself (ADR 01 §8); pgBackRest carries posix, s3, gcs, azure,
+# sftp and cifs in one binary, so there is nothing left to gate.
+[dependencies]
+pgpod-core.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

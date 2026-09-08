@@ -5,8 +5,6 @@
 //! show up in `podman inspect`, in `/proc/<pid>/environ`, and in error
 //! paths that log a whole spec (ADR 00 §9).
 
-use podman_api::opts::SecretCreateOpts;
-
 use crate::client::PodmanClient;
 use crate::error::{Error, Result};
 
@@ -22,24 +20,48 @@ impl PodmanClient {
     /// Podman secrets are immutable, so a rotation means delete-then-create.
     /// The value is taken as `&str` and never logged; callers hold it in a
     /// `pgpod_core::Secret` right up to this call.
+    ///
+    /// **Posted as raw bytes through `crate::http`, not through
+    /// `podman-api`.** Its `Secrets::create` sends
+    /// `serde_json::to_string(&secret)`, so libpod stores the JSON
+    /// *encoding* — a payload wrapped in quotes with `\n` as two literal
+    /// characters — where the endpoint wants the bytes themselves. pgpod
+    /// stored every secret that way from Phase 1 until this was found, and
+    /// nothing noticed, because it is self-consistent: `initdb` set the
+    /// superuser password from the quoted file and every later connection
+    /// read the same quoted file. It breaks the moment anything else has
+    /// to parse a secret, and it means a secret created by hand with
+    /// `podman secret create` does not match one pgpod created.
     pub async fn put_secret(&self, name: &str, value: &str) -> Result<SecretInfo> {
         // Ignore a missing-secret error on the delete: this is the normal
         // first-create path.
         let _ = self.remove_secret(name).await;
 
-        let opts = SecretCreateOpts::builder(name).build();
-        let created = self
-            .podman()
-            .secrets()
-            .create(&opts, value.to_string())
-            .await
-            // Deliberately does not include the underlying error's body:
-            // podman echoes request context on some failures, and the
-            // request body here is the secret.
-            .map_err(|_| Error::Secret(format!("failed to create secret {name}")))?;
+        let (status, response) = crate::http::post_bytes(
+            self.socket_path(),
+            &format!("/v4.0.0/libpod/secrets/create?name={name}"),
+            value.as_bytes(),
+        )
+        .await?;
+
+        if !(200..300).contains(&status) {
+            // Deliberately does not echo the response body: podman repeats
+            // request context on some failures, and the request body here
+            // is the secret.
+            return Err(Error::Secret(format!(
+                "failed to create secret {name}: HTTP {status}"
+            )));
+        }
+
+        let created: serde_json::Value = serde_json::from_str(&response)
+            .map_err(|_| Error::Secret(format!("create secret {name}: unreadable response")))?;
 
         Ok(SecretInfo {
-            id: created.id().to_string(),
+            id: created
+                .get("ID")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
             name: name.to_string(),
         })
     }

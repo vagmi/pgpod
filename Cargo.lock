@@ -939,11 +939,24 @@ dependencies = [
  "anyhow",
  "clap",
  "nix",
+ "pgpod-backup",
  "pgpod-core",
  "pgpod-pg",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "pgpod-backup"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "pgpod-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -951,8 +964,10 @@ name = "pgpod-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "nix",
+ "pgpod-backup",
  "pgpod-control",
  "pgpod-core",
  "pgpod-runtime",
@@ -967,6 +982,8 @@ dependencies = [
 name = "pgpod-control"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "pgpod-backup",
  "pgpod-core",
  "pgpod-pg",
  "pgpod-registry",
@@ -984,6 +1001,7 @@ dependencies = [
 name = "pgpod-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs",
  "serde",
  "serde_json",
@@ -1026,15 +1044,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "pgpod-store"
-version = "0.1.0"
-dependencies = [
- "pgpod-core",
- "serde",
- "thiserror 2.0.20",
 ]
 
 [[package]]

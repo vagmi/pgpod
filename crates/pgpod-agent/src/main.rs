@@ -9,15 +9,22 @@
 //!
 //! 1. **Container entrypoint** (`instance run`) — bootstraps PGDATA,
 //!    renders config, then supervises `postgres` and serves `/status`.
-//! 2. **Invoked by PostgreSQL itself** (`wal archive`, `wal restore`) as
-//!    `archive_command` and `restore_command`. Landing in Phase 2.
+//!
+//! It no longer ships WAL or takes base backups. PostgreSQL invokes
+//! pgBackRest directly as `archive_command` and `restore_command`, and
+//! backups run in a job container; the agent renders pgBackRest's
+//! configuration and creates its stanza (ADR 04).
 
 mod bootstrap;
 mod log;
+mod pgbackrest;
 mod psql;
+mod recovery;
 mod secrets;
 mod status;
 mod supervise;
+
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -35,9 +42,6 @@ enum Command {
     /// Instance lifecycle. Run as the container entrypoint.
     #[command(subcommand)]
     Instance(InstanceCommand),
-    /// WAL shipping. Invoked by PostgreSQL, not by a human.
-    #[command(subcommand)]
-    Wal(WalCommand),
 }
 
 #[derive(Subcommand)]
@@ -46,14 +50,6 @@ enum InstanceCommand {
     Run,
     /// Print what postgres currently reports about itself, as JSON.
     Status,
-}
-
-#[derive(Subcommand)]
-enum WalCommand {
-    /// `archive_command` — ship one segment to object storage.
-    Archive { path: String },
-    /// `restore_command` — fetch one segment from object storage.
-    Restore { name: String, target: String },
 }
 
 #[tokio::main]
@@ -66,13 +62,6 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&status::probe())?);
             Ok(())
         }
-        Command::Wal(_) => {
-            // Deliberately an error, not a silent success. An
-            // archive_command that exits 0 without storing anything tells
-            // PostgreSQL it may recycle WAL that was never archived —
-            // the exact silent data loss ADR 01 §1 exists to prevent.
-            anyhow::bail!("WAL shipping is not implemented yet (Phase 2)")
-        }
     }
 }
 
@@ -84,19 +73,67 @@ async fn run() -> Result<()> {
         secrets::InstanceSecrets::from_mounts().context("could not read the mounted secrets")?;
 
     bootstrap::ensure_layout()?;
-    let fresh = bootstrap::initdb_if_needed(&spec, &secrets)?;
+    let bootstrapped = bootstrap::bootstrap_if_needed(&spec, &secrets)?;
 
     // Rendered on every start, not just after bootstrap, so a spec change
     // takes effect on restart with no special case.
     bootstrap::render_config(&spec)?;
 
-    if fresh {
+    if bootstrapped == bootstrap::Bootstrapped::Initdb {
         // Roles must exist before anything can connect over TCP, so this
         // runs against a postmaster bound to the unix socket only.
-        supervise::with_local_postgres(|| bootstrap::create_roles(&spec, &secrets))?;
+        //
+        // Not on the restored path: a restored cluster arrives with its
+        // roles already in it, and rewriting them would change the
+        // passwords of a database being restored precisely so that it is
+        // as it was.
+        supervise::with_local_postgres(|| {
+            bootstrap::create_roles(&spec, &secrets)?;
+            // While PostgreSQL is up but reachable only over the unix
+            // socket, and *before* the real postmaster starts archiving.
+            // pgBackRest needs a live server to create a stanza, and every
+            // segment archived before the stanza exists is a failure
+            // PostgreSQL has to retry — harmless, but it puts errors in
+            // the log of a cluster that is working correctly.
+            if spec.backup.is_enabled() {
+                pgbackrest::ensure_stanza(
+                    spec.instance.cluster().as_str(),
+                    pgpod_core::container::BOOTSTRAP_PORT,
+                )?;
+            }
+            Ok(())
+        })?;
     }
 
     let child = supervise::spawn_postgres()?;
+
+    // The stanza has to exist before pgBackRest will accept a segment, and
+    // creating it needs a running PostgreSQL — pgBackRest connects to read
+    // the cluster's identity. So it happens here, after the postmaster is
+    // up, rather than during bootstrap.
+    //
+    // On every start, not only the first: the repository is not pgpod's to
+    // assume. It may have been created by an older pgpod, emptied by an
+    // operator, or be a destination added to a cluster that already
+    // existed.
+    // Not on the initdb path, where it already ran above against the
+    // bootstrap postmaster.
+    if spec.backup.is_enabled() && bootstrapped != bootstrap::Bootstrapped::Initdb {
+        let stanza = spec.instance.cluster().as_str().to_string();
+        tokio::spawn(async move {
+            if supervise::wait_until_ready(Duration::from_secs(120)).await {
+                let _ = pgbackrest::ensure_stanza(
+                    &stanza,
+                    pgpod_core::container::PG_PORT,
+                );
+            } else {
+                warn!(
+                    "postgres did not become ready in time, so the pgbackrest \
+                     stanza was not created"
+                );
+            }
+        });
+    }
 
     // The status socket outlives individual probes but not the process;
     // it is dropped when the agent exits.

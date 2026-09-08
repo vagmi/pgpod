@@ -11,10 +11,11 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use pgpod_backup::PgBackRestConfig;
 use pgpod_core::{Bootstrap, InstanceSpec, Secret, container};
 use pgpod_pg::{
     AppDatabase, ArchiveMode, BootstrapRoles, HbaConfig, INCLUDE_DIR_LINE, InitdbOptions,
-    MANAGED_CONF_FILE, ManagedConf, PWFILE_PATH, USER_CONF_FILE, render_user_conf,
+    MANAGED_CONF_FILE, ManagedConf, PWFILE_PATH, RecoveryConf, USER_CONF_FILE, render_user_conf,
 };
 
 use crate::psql;
@@ -32,6 +33,9 @@ pub fn ensure_layout() -> Result<()> {
         container::PGDATA,
         container::CONF_DIR,
         container::SPOOL_DIR,
+        // pgBackRest writes here. Its defaults under /var are not
+        // writable on a read-only rootfs (ADR 04 §3).
+        container::LOG_DIR,
         // Inside the volume rather than the image's own
         // /var/run/postgresql — see container::SOCKET_DIR.
         container::SOCKET_DIR,
@@ -44,16 +48,49 @@ pub fn ensure_layout() -> Result<()> {
     Ok(())
 }
 
-/// Run `initdb` if PGDATA is empty. Returns whether it actually ran.
-pub fn initdb_if_needed(spec: &InstanceSpec, secrets: &InstanceSecrets) -> Result<bool> {
+/// What bootstrapping did, so the caller knows what still has to happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bootstrapped {
+    /// PGDATA was already there. Nothing to do but start.
+    Existing,
+    /// `initdb` ran, so roles and the application database still need
+    /// creating.
+    Initdb,
+    /// A base backup was restored. Roles came with it — creating them
+    /// again would fail, and creating them *differently* would change the
+    /// passwords of a database the operator is restoring precisely
+    /// because they want it as it was.
+    Restored,
+}
+
+/// Populate PGDATA if it is empty, by whichever route the spec asks for.
+pub fn bootstrap_if_needed(spec: &InstanceSpec, secrets: &InstanceSecrets) -> Result<Bootstrapped> {
     let pgdata = Path::new(container::PGDATA);
     if psql::is_initialised(pgdata) {
-        info!("PGDATA already initialised, skipping initdb");
-        return Ok(false);
+        info!("PGDATA already initialised, skipping bootstrap");
+        return Ok(Bootstrapped::Existing);
     }
 
-    let Bootstrap::Initdb(init) = &spec.bootstrap;
+    match &spec.bootstrap {
+        Bootstrap::Initdb(init) => {
+            run_initdb_bootstrap(init, secrets)?;
+            Ok(Bootstrapped::Initdb)
+        }
+        Bootstrap::Recovery(recovery) => {
+            // pgBackRest needs its configuration before it can do
+            // anything, and on a restore this runs before the ordinary
+            // render_config below — PGDATA does not exist yet.
+            write_pgbackrest_conf(spec)?;
+            crate::recovery::restore(recovery)?;
+            Ok(Bootstrapped::Restored)
+        }
+    }
+}
 
+fn run_initdb_bootstrap(
+    init: &pgpod_core::InitdbBootstrap,
+    secrets: &InstanceSecrets,
+) -> Result<()> {
     let opts = InitdbOptions {
         superuser: "postgres".to_string(),
         encoding: init.encoding.clone(),
@@ -71,12 +108,13 @@ pub fn initdb_if_needed(spec: &InstanceSpec, secrets: &InstanceSecrets) -> Resul
 
     // PostgreSQL reads `include_dir` relative to the data directory, so
     // this one line is what makes conf.d/ take effect at all.
-    append_include_dir(pgdata)?;
+    append_include_dir(Path::new(container::PGDATA))?;
 
     info!("initdb complete");
-    Ok(true)
+    Ok(())
 }
 
+#[allow(clippy::items_after_statements)]
 fn write_pwfile(password: &Secret) -> Result<()> {
     use std::io::Write as _;
     let mut f = fs::OpenOptions::new()
@@ -145,8 +183,29 @@ pub fn render_config(spec: &InstanceSpec) -> Result<()> {
         },
         None => ArchiveMode::Off,
     };
+
+    // Rendered only while `recovery.signal` is still there. PostgreSQL
+    // removes it on promotion, so a restored instance that is restarted
+    // afterwards comes up as an ordinary primary rather than trying to
+    // replay an archive it has already finished with.
+    let recovery = spec
+        .recovery()
+        .filter(|_| !crate::recovery::recovery_finished())
+        .map(|r| RecoveryConf {
+            // Names the *source* stanza: a restored cluster reads one
+            // repository subtree and, once promoted, writes to another.
+            restore_command: pgpod_pg::restore_command(&r.source_stanza),
+            target_time: r.target_time.clone(),
+        });
+
+    // pgBackRest's own configuration, rewritten on every start for the
+    // same reason PostgreSQL's is: a spec change takes effect on restart
+    // with no special case.
+    write_pgbackrest_conf(spec)?;
+
     let managed = ManagedConf::primary(spec.port)
         .with_archive(archive)
+        .with_recovery(recovery)
         .with_shared_preload_libraries(spec.shared_preload_libraries.clone());
 
     write_atomically(&conf_d.join(MANAGED_CONF_FILE), &managed.render())?;
@@ -168,6 +227,79 @@ pub fn render_config(spec: &InstanceSpec) -> Result<()> {
     Ok(())
 }
 
+/// Render `pgbackrest.conf` into the volume.
+///
+/// A no-op for a cluster with no destinations: pgBackRest is never invoked
+/// there, `archive_mode` renders `off`, and writing a config naming no
+/// repository would only be something to misread later.
+fn write_pgbackrest_conf(spec: &InstanceSpec) -> Result<()> {
+    let recovery = spec.recovery();
+
+    // A restored instance reads the source's repository until it is
+    // promoted, and its own thereafter. During recovery the source's
+    // destinations are the ones that must be configured.
+    let destinations = match recovery {
+        Some(r) if !crate::recovery::recovery_finished() => &r.destinations,
+        _ => &spec.backup.destinations,
+    };
+    if destinations.is_empty() {
+        return Ok(());
+    }
+
+    let mut credentials = Vec::new();
+    for index in 0..destinations.len() {
+        credentials.push(read_store_credentials(index)?);
+    }
+
+    let config = PgBackRestConfig::new(
+        spec.instance.cluster().as_str(),
+        destinations,
+        spec.backup.retention.as_deref(),
+        spec.backup.retention_mode,
+    )
+    .context("could not build the pgbackrest configuration")?
+    .with_credentials(credentials)
+    .with_recovery_stanza(recovery.map(|r| r.source_stanza.clone()));
+
+    // 0600: it can carry object-store credentials, read out of a mounted
+    // secret. Same treatment as the replication passfile beside it.
+    write_atomically(Path::new(container::PGBACKREST_CONF), &config.render())
+}
+
+/// Read one destination's credentials out of its mounted podman secret.
+///
+/// `KEY=value` lines using pgBackRest's repository option names **without**
+/// the `repoN-` prefix — `s3-key`, `s3-key-secret`, `gcs-key-type` — so an
+/// operator never has to know which repository number their destination
+/// became. pgpod adds the index.
+///
+/// Missing is not an error: on GCE nothing is mounted at all, because
+/// pgBackRest authorizes with the instance service account. Present and
+/// unreadable *is* an error — that is a mount that went wrong, and
+/// archiving without credentials would fail later and further away.
+fn read_store_credentials(index: usize) -> Result<Vec<(String, String)>> {
+    let path = pgpod_core::Destination::credentials_path(index);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => bail!("{path} exists but could not be read: {e}"),
+    };
+
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Never the value itself: this ends up in a container log line.
+        let Some((k, v)) = line.split_once('=') else {
+            bail!("{path} has a line that is not KEY=value");
+        };
+        out.push((k.trim().to_string(), v.trim().to_string()));
+    }
+    Ok(out)
+}
+
 /// Write via a temp file and rename.
 ///
 /// A crash midway through rewriting `pg_hba.conf` in place would leave a
@@ -186,10 +318,16 @@ fn write_atomically(path: &Path, contents: &str) -> Result<()> {
 
 /// Create pgpod's roles and the application database.
 ///
-/// Runs against a PostgreSQL started on the unix socket only — see
-/// [`crate::supervise::with_local_postgres`]. Idempotent.
+/// Runs against the private bootstrap postmaster — see
+/// [`crate::supervise::with_local_postgres`] for why it is on its own
+/// port. Idempotent.
 pub fn create_roles(spec: &InstanceSpec, secrets: &InstanceSecrets) -> Result<()> {
-    let Bootstrap::Initdb(init) = &spec.bootstrap;
+    let Bootstrap::Initdb(init) = &spec.bootstrap else {
+        // Only reachable through a caller bug: a restored cluster already
+        // has its roles, and rewriting them would change the passwords of
+        // a database being restored precisely so it is as it was.
+        bail!("create_roles was called on an instance that was not initdb-bootstrapped");
+    };
 
     let app = match (&init.database, &init.owner) {
         (Some(database), Some(owner)) => Some(AppDatabase {
@@ -223,12 +361,25 @@ pub fn create_roles(spec: &InstanceSpec, secrets: &InstanceSecrets) -> Result<()
         .context("failed to render bootstrap SQL")?
     {
         // `what` rather than the statement itself: these contain passwords.
-        psql::execute("postgres", &stmt, "role bootstrap")?;
+        psql::execute_on(
+            container::BOOTSTRAP_PORT,
+            "postgres",
+            &stmt,
+            "role bootstrap",
+        )?;
     }
 
     if let Some((check, create)) = roles.app_database_sql()? {
-        if psql::query("postgres", &check)?.trim().is_empty() {
-            psql::execute("postgres", &create, "create application database")?;
+        if psql::query_on(container::BOOTSTRAP_PORT, "postgres", &check)?
+            .trim()
+            .is_empty()
+        {
+            psql::execute_on(
+                container::BOOTSTRAP_PORT,
+                "postgres",
+                &create,
+                "create application database",
+            )?;
             info!("application database created");
         } else {
             info!("application database already exists");

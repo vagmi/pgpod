@@ -3,6 +3,7 @@
 //! Everything `pgpod` the command can do goes through [`Pgpod`], so an
 //! embedder has exactly the same surface (`AGENTS.md` principle 7).
 
+mod backup;
 mod names;
 mod password;
 mod status;
@@ -19,6 +20,7 @@ use pgpod_runtime::{
     ContainerSpec, ExecSpec, Mount, PodmanClient, PortPublish, SecretMount, VolumeInfo,
 };
 
+pub use backup::{BackupReport, RestoreReport};
 pub use names::{LABEL_CLUSTER, LABEL_INSTANCE, SecretNames};
 pub use status::{ClusterStatus, InstanceStatus};
 
@@ -39,6 +41,18 @@ pub enum Error {
     #[error(transparent)]
     Spec(#[from] pgpod_core::SpecError),
 
+    #[error(transparent)]
+    Backup(#[from] pgpod_backup::Error),
+
+    #[error("pgbackrest {command} failed\n\n{detail}")]
+    PgBackRest { command: String, detail: String },
+
+    #[error(
+        "the pgBackRest bundle is not installed at {0} — build it with \
+         ops/build-pgbackrest.sh"
+    )]
+    PgBackRestMissing(String),
+
     #[error(
         "the pgpod agent is not installed at {0} — build and install it with \
          ops/build-agent.sh"
@@ -55,6 +69,15 @@ pub enum Error {
         detail: String,
     },
 
+    #[error(
+        "{instance} is running a different spec than the manifest describes, and \
+         the spec is fixed when the container is created — a restart would \
+         re-run the agent with the old one.\n\n{detail}\n\n\
+         Recreate the instance to apply this: `pgpod delete <cluster>` keeps \
+         the volume and the data, then `pgpod apply -f <manifest>`."
+    )]
+    Diverged { instance: String, detail: String },
+
     #[error("{0}")]
     Invalid(String),
 }
@@ -66,6 +89,20 @@ pub struct Pgpod {
     podman: PodmanClient,
     registry: Registry,
     layout: PathLayout,
+}
+
+/// The things every instance in one `apply` shares.
+///
+/// Threaded through as a struct rather than as five more parameters: they
+/// are computed once per apply and are the same for every instance, so
+/// passing them individually invites a caller passing one instance's value
+/// while creating another.
+struct ApplyContext<'a> {
+    bootstrap: Bootstrap,
+    /// The cluster's podman subnet, for `pg_hba.conf`.
+    network_cidr: Option<String>,
+    secrets: SecretNames,
+    agent: &'a std::path::Path,
 }
 
 /// What `apply` did.
@@ -123,13 +160,30 @@ impl Pgpod {
 
     /// Create or converge a cluster.
     pub async fn apply(&self, manifest: &ClusterManifest, wait: Duration) -> Result<ApplyReport> {
+        self.apply_with_bootstrap(
+            manifest,
+            Bootstrap::Initdb(manifest.spec.bootstrap.initdb.clone()),
+            wait,
+        )
+        .await
+    }
+
+    /// `apply`, with the bootstrap mode chosen by the caller.
+    ///
+    /// `restore` needs the whole of `apply` — network, secrets, volume,
+    /// container, readiness — differing only in how PGDATA gets populated.
+    /// Duplicating that would mean two paths to a running instance, and
+    /// the restored one would be the less-exercised of the two.
+    pub(crate) async fn apply_with_bootstrap(
+        &self,
+        manifest: &ClusterManifest,
+        bootstrap: Bootstrap,
+        wait: Duration,
+    ) -> Result<ApplyReport> {
         let cluster = manifest.cluster_id()?;
         self.validate_parameters(manifest)?;
 
-        let agent = self.layout.agent_binary_for_host();
-        if !agent.exists() {
-            return Err(Error::AgentMissing(agent.display().to_string()));
-        }
+        let agent = self.agent_binary()?;
 
         let existed = self.registry.cluster(&cluster)?.is_some();
         let generation = self.registry.put_cluster(manifest, "applying")?;
@@ -139,18 +193,32 @@ impl Pgpod {
         // One network per cluster even at a single instance, so adding a
         // standby later does not have to move a running primary onto a
         // different network.
-        self.podman
+        let network = self
+            .podman
             .ensure_network(&cluster.network_name(), &names::cluster_labels(&cluster))
             .await?;
 
-        let secrets = self.ensure_secrets(&cluster, manifest).await?;
+        // Created before any instance starts, because archive_mode is
+        // already `on` by then and the first segment can be archived
+        // before `apply` returns. Never deleted implicitly: it holds the
+        // backups (AGENTS.md principle 4).
+        if let Some(volume) = &manifest.spec.backup.volume {
+            self.podman
+                .create_volume(volume, &names::cluster_labels(&cluster))
+                .await?;
+        }
+
+        let ctx = ApplyContext {
+            bootstrap,
+            network_cidr: network.subnet.clone(),
+            secrets: self.ensure_secrets(&cluster, manifest).await?,
+            agent: &agent,
+        };
 
         let mut summaries = Vec::new();
         for ordinal in 1..=manifest.spec.instances {
             let instance = cluster.instance(ordinal);
-            let summary = self
-                .apply_instance(manifest, &instance, &secrets, &agent)
-                .await?;
+            let summary = self.apply_instance(manifest, &instance, &ctx).await?;
             summaries.push(summary);
         }
 
@@ -193,8 +261,7 @@ impl Pgpod {
         &self,
         manifest: &ClusterManifest,
         instance: &InstanceId,
-        secrets: &SecretNames,
-        agent: &std::path::Path,
+        ctx: &ApplyContext<'_>,
     ) -> Result<InstanceSummary> {
         let cluster = instance.cluster().clone();
         let existing = self.registry.instance(&cluster, instance.ordinal())?;
@@ -229,13 +296,17 @@ impl Pgpod {
         let handle = self.podman.container(instance.container_name());
         let probe = handle.probe().await?;
         let container_id = match probe {
-            Some(p) if p.running => p.id,
+            Some(p) if p.running => {
+                Self::refuse_if_diverged(manifest, instance, ctx, &p)?;
+                p.id
+            }
             Some(p) => {
+                Self::refuse_if_diverged(manifest, instance, ctx, &p)?;
                 self.podman.container(&p.id).start().await?;
                 p.id
             }
             None => {
-                let spec = self.container_spec(manifest, instance, host_port, secrets, agent)?;
+                let spec = self.container_spec(manifest, instance, ctx, host_port)?;
                 self.podman
                     .pull_image_if_absent(&manifest.spec.image_name)
                     .await?;
@@ -267,32 +338,76 @@ impl Pgpod {
         })
     }
 
+    /// The spec the agent will act on.
+    ///
+    /// Separate from [`Self::container_spec`] because it is also what
+    /// [`Self::instance_diverged`] compares against a running container:
+    /// the two must be built by the same code, or the check would report
+    /// drift that is only a difference in how the comparison was written.
+    fn instance_spec(
+        manifest: &ClusterManifest,
+        instance: &InstanceId,
+        ctx: &ApplyContext<'_>,
+    ) -> Result<InstanceSpec> {
+        // Presence of a destination is what turns archiving on. The switch
+        // already exists in the renderer, so a cluster created *with* a
+        // destination has `archive_mode = on` before postgres ever starts
+        // — no restart, no special case (ADR 01 §1).
+        let backup = pgpod_core::BackupSpec {
+            destinations: manifest
+                .spec
+                .backup
+                .destinations
+                .iter()
+                // Podman secret names mean nothing inside the container;
+                // the agent reads credentials from an indexed mount.
+                .map(|d| d.sanitized())
+                .collect(),
+            ..manifest.spec.backup.clone()
+        };
+        let archive_command = backup
+            .is_enabled()
+            .then(|| pgpod_pg::archive_command(instance.cluster().as_str()));
+
+        let spec = InstanceSpec {
+            instance: instance.clone(),
+            port: 5432,
+            bootstrap: ctx.bootstrap.clone(),
+            parameters: manifest.parameters(),
+            shared_preload_libraries: manifest.spec.postgresql.shared_preload_libraries.clone(),
+            // Scoped to the cluster's own podman subnet, never guessed
+            // and never wide open.
+            //
+            // Phase 1 left this `None` at one instance, on the reasoning
+            // that a single-instance cluster has nobody to talk to. Base
+            // backups made that false: the job container from ADR 01 §4
+            // is a *separate* container on this network, connecting as
+            // `streaming_replica`, and with no host rule PostgreSQL
+            // rejects it — which is `pg_hba.conf` behaving correctly and
+            // the backup failing for a reason nothing in the manifest
+            // explains.
+            network_cidr: ctx.network_cidr.clone(),
+            archive_command,
+            backup,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
     fn container_spec(
         &self,
         manifest: &ClusterManifest,
         instance: &InstanceId,
+        ctx: &ApplyContext<'_>,
         host_port: u16,
-        secrets: &SecretNames,
-        agent: &std::path::Path,
     ) -> Result<ContainerSpec> {
-        let spec = InstanceSpec {
-            instance: instance.clone(),
-            port: 5432,
-            bootstrap: Bootstrap::Initdb(manifest.spec.bootstrap.initdb.clone()),
-            parameters: manifest.parameters(),
-            shared_preload_libraries: manifest.spec.postgresql.shared_preload_libraries.clone(),
-            // Single-instance clusters need no pg_hba network rules, and a
-            // guessed CIDR would be either useless or too wide.
-            network_cidr: None,
-            // Phase 2 turns this on. Until then archive_mode renders off
-            // rather than archiving to nowhere.
-            archive_command: None,
-        };
+        let spec = Self::instance_spec(manifest, instance, ctx)?;
+        let (secrets, agent) = (&ctx.secrets, ctx.agent);
 
         let uid = manifest.spec.postgres_uid;
         let gid = manifest.spec.postgres_gid;
 
-        let mut c = ContainerSpec::hardened(&manifest.spec.image_name)
+        let mut c: ContainerSpec = ContainerSpec::hardened(&manifest.spec.image_name)
             .name(instance.container_name())
             .hostname(instance.container_name())
             // Explicit, because the official images declare no USER and
@@ -315,12 +430,49 @@ impl Pgpod {
                 target: container::AGENT_BIN.to_string(),
             });
 
-        for (name, target) in [
+        // pgBackRest, when this cluster archives. A directory rather than
+        // the agent's single file, because it travels with its own
+        // libraries and loader — which is what lets it run in an image it
+        // was not built for (ADR 04 §2).
+        if spec.backup.is_enabled() || spec.recovery().is_some() {
+            c = c.mount(Mount::BindReadOnly {
+                source: self.pgbackrest_bundle()?.display().to_string(),
+                target: container::PGBACKREST_BUNDLE.to_string(),
+            });
+        }
+
+        // The archive volume, when the cluster ships to a file://
+        // destination. Mounted read-write and *outside* the instance's own
+        // volume, so `pgpod delete --purge` cannot destroy the backups
+        // along with the database they protect.
+        //
+        // A restored instance reads its source's archive, which is why the
+        // recovery bootstrap's destinations are consulted too — the two
+        // clusters may name different volumes.
+        if let Some(volume) = archive_volume(manifest, &spec) {
+            c = c.mount(Mount::Volume {
+                name: volume,
+                target: container::ARCHIVE_MOUNT.to_string(),
+                chown: false,
+            });
+        }
+
+        // `ensure_secrets` creates the app-owner secret only for a cluster
+        // that asks for an application database, so mounting it
+        // unconditionally makes podman refuse to create the container with
+        // "no such secret" — a manifest without `bootstrap.initdb.database`
+        // could never have started. The two conditions have to be the same
+        // one, so they read from the same place.
+        let mut mounts = vec![
             (&secrets.superuser, container::SECRET_SUPERUSER),
             (&secrets.replication, container::SECRET_REPLICATION),
             (&secrets.monitor, container::SECRET_MONITOR),
-            (&secrets.app_owner, container::SECRET_APP_OWNER),
-        ] {
+        ];
+        if manifest.spec.bootstrap.initdb.database.is_some() {
+            mounts.push((&secrets.app_owner, container::SECRET_APP_OWNER));
+        }
+
+        for (name, target) in mounts {
             c = c.secret(SecretMount {
                 name: name.clone(),
                 target: target.to_string(),
@@ -330,10 +482,81 @@ impl Pgpod {
             });
         }
 
+        // Object-store credentials, one mount per destination, addressed
+        // by index. Absent is the normal case on GCE, where object_store
+        // authenticates through the instance metadata server and there is
+        // nothing to mount.
+        for (index, dest) in manifest.spec.backup.destinations.iter().enumerate() {
+            if let Some(secret) = &dest.credentials {
+                c = c.secret(SecretMount {
+                    name: secret.clone(),
+                    target: pgpod_core::Destination::credentials_path(index),
+                    mode: 0o400,
+                    uid,
+                    gid,
+                });
+            }
+        }
+
         for (k, v) in names::instance_labels(instance) {
             c = c.label(k, v);
         }
         Ok(c)
+    }
+
+    /// Refuse to adopt a container that is running an older manifest.
+    ///
+    /// `apply` adopts a container that already exists rather than
+    /// recreating it, which is right: recreating a healthy instance is a
+    /// pointless outage. But the instance spec travels in an environment
+    /// variable fixed at **container-create** time (`pgpod_core::spec`),
+    /// so changing anything in it — parameters, preload libraries, image,
+    /// a backup destination — needs the container *recreated*, not merely
+    /// restarted. A restart re-runs the agent with the stale value.
+    ///
+    /// Nothing detected that until now, so `apply` would report success
+    /// and change nothing. Adding a backup destination to a live cluster
+    /// is the case that makes it dangerous rather than merely confusing:
+    /// the operator sees "apply complete", believes their WAL is being
+    /// archived, and finds out otherwise at the restore.
+    ///
+    /// Phase 2 does not solve reconfiguration — the fix is `delete` (which
+    /// keeps the volume and the data) followed by `apply`. What it does is
+    /// refuse to pretend. The real version, which knows that
+    /// `archive_command` is reloadable while `archive_mode` and
+    /// `shared_preload_libraries` are restart-only, belongs with the
+    /// reconciler in Phase 4.
+    fn refuse_if_diverged(
+        manifest: &ClusterManifest,
+        instance: &InstanceId,
+        ctx: &ApplyContext<'_>,
+        probe: &pgpod_runtime::ContainerProbe,
+    ) -> Result<()> {
+        let Some(running) = probe.env_var(SPEC_ENV) else {
+            // No spec in the environment at all: not a container pgpod
+            // created, or one from before the spec was carried this way.
+            // Adopting it blind would be worse than saying so.
+            return Err(Error::Diverged {
+                instance: instance.to_string(),
+                detail: format!("the running container has no {SPEC_ENV}"),
+            });
+        };
+
+        let desired = Self::instance_spec(manifest, instance, ctx)?;
+        // Compared as parsed values, not as strings: JSON key order and
+        // whitespace are not manifest changes, and reporting them as such
+        // would train operators to ignore this error.
+        let running: InstanceSpec = serde_json::from_str(running)
+            .map_err(|e| Error::Spec(pgpod_core::SpecError::Malformed(e.to_string())))?;
+
+        if running == desired {
+            return Ok(());
+        }
+
+        Err(Error::Diverged {
+            instance: instance.to_string(),
+            detail: differences(&running, &desired).join("\n"),
+        })
     }
 
     /// Create the cluster's secrets if they do not exist.
@@ -384,20 +607,47 @@ impl Pgpod {
                 Ok(out) => last = format!("{}{}", out.stdout.trim(), out.stderr.trim()),
                 Err(e) => last = e.to_string(),
             }
+
+            // A container that has exited is never going to become ready,
+            // and polling it until the deadline turns a clear failure into
+            // a long hang. It matters most on the path with the longest
+            // timeout: a restore whose recovery target is unreachable
+            // FATALs in seconds, and waiting half an hour to say so would
+            // leave an operator watching a blank terminal during exactly
+            // the incident they are trying to recover from.
+            if let Some(probe) = container.probe().await?
+                && !probe.running
+            {
+                return Err(self.not_ready(instance, &container, timeout, &last).await);
+            }
+
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        // Container logs are where the real reason lives — a failed
-        // initdb, a bad parameter, a missing secret.
+        Err(self.not_ready(instance, &container, timeout, &last).await)
+    }
+
+    /// Build the "did not come up" error, with the reason attached.
+    ///
+    /// Container logs are where the real cause lives — a failed initdb, a
+    /// bad parameter, a missing secret, or a recovery target the archive
+    /// cannot reach.
+    async fn not_ready(
+        &self,
+        instance: &InstanceId,
+        container: &pgpod_runtime::Container,
+        timeout: Duration,
+        last_probe: &str,
+    ) -> Error {
         let logs = container
             .logs_string()
             .await
             .unwrap_or_else(|e| format!("<logs unavailable: {e}>"));
-        Err(Error::NotReady {
+        Error::NotReady {
             instance: instance.to_string(),
             seconds: timeout.as_secs(),
-            detail: format!("last probe: {last}\n\ncontainer logs:\n{logs}"),
-        })
+            detail: format!("last probe: {last_probe}\n\ncontainer logs:\n{logs}"),
+        }
     }
 
     // ---- status ------------------------------------------------------
@@ -445,6 +695,10 @@ impl Pgpod {
             }
         }
 
+        // Instance volumes only. The archive volume is deliberately not
+        // touched even by `--purge`: it holds the backups, and destroying
+        // those together with the database they protect is the one thing
+        // an operator would never mean by "delete this cluster".
         for inst in &instances {
             if purge {
                 self.podman
@@ -489,6 +743,112 @@ impl Pgpod {
             volumes_retained,
         })
     }
+}
+
+/// The podman volume an instance needs mounted at
+/// `container::ARCHIVE_MOUNT`, if any.
+///
+/// One field covers both the ordinary and the restored case: `restore`
+/// builds the target cluster's manifest from the source's, so a restored
+/// instance names the same volume it will read the base backup out of. The
+/// spec is passed in so this cannot silently succeed for an instance whose
+/// recovery bootstrap points somewhere the manifest does not.
+fn archive_volume(manifest: &ClusterManifest, spec: &InstanceSpec) -> Option<String> {
+    let volume = manifest.spec.backup.volume.clone();
+    if volume.is_none()
+        && let Some(recovery) = spec.recovery()
+        && recovery
+            .destinations
+            .iter()
+            .any(|d| d.url.trim().starts_with("file://"))
+    {
+        // Unreachable through `restore`, which copies the manifest. It
+        // would mean a hand-built spec, and the instance would fail on its
+        // first restore_command with a confusing "not found".
+        tracing::warn!(
+            "instance restores from a file:// archive but its manifest names no \
+             spec.backup.volume — the archive will not be mounted"
+        );
+    }
+    volume
+}
+
+/// Name what changed between two specs.
+///
+/// A diff rather than "they differ": the operator has to decide whether a
+/// recreate is worth an outage, and cannot without knowing what moved.
+fn differences(running: &InstanceSpec, desired: &InstanceSpec) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut note = |field: &str, from: String, to: String| {
+        if from != to {
+            out.push(format!("  {field}: {from} -> {to}"));
+        }
+    };
+
+    note(
+        "bootstrap",
+        format!("{:?}", running.bootstrap),
+        format!("{:?}", desired.bootstrap),
+    );
+    note(
+        "parameters",
+        format!("{:?}", running.parameters),
+        format!("{:?}", desired.parameters),
+    );
+    note(
+        "sharedPreloadLibraries",
+        format!("{:?}", running.shared_preload_libraries),
+        format!("{:?}", desired.shared_preload_libraries),
+    );
+    note(
+        "archive_mode",
+        archive_mode_of(running).to_string(),
+        archive_mode_of(desired).to_string(),
+    );
+    note(
+        "backup.destinations",
+        destination_urls(running),
+        destination_urls(desired),
+    );
+    note(
+        "backup.retention",
+        format!(
+            "{:?} ({:?})",
+            running.backup.retention, running.backup.retention_mode
+        ),
+        format!(
+            "{:?} ({:?})",
+            desired.backup.retention, desired.backup.retention_mode
+        ),
+    );
+
+    if out.is_empty() {
+        // Equality already failed, so something changed that this diff
+        // does not name. Say that, rather than printing an empty list and
+        // looking like a bug.
+        out.push("  (a field this diff does not yet name)".to_string());
+    }
+    out
+}
+
+fn archive_mode_of(spec: &InstanceSpec) -> &'static str {
+    if spec.archive_command.is_some() {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn destination_urls(spec: &InstanceSpec) -> String {
+    if spec.backup.destinations.is_empty() {
+        return "none".to_string();
+    }
+    spec.backup
+        .destinations
+        .iter()
+        .map(|d| d.url.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A libpq URI for an instance.

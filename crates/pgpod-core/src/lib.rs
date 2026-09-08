@@ -5,6 +5,7 @@
 //! crates that need the same type promote it here rather than duplicating
 //! it (see `adrs/00-project-setup.md` §2).
 
+mod backup;
 mod ids;
 mod lifecycle;
 mod manifest;
@@ -12,6 +13,10 @@ mod paths;
 mod secret;
 mod spec;
 
+pub use backup::{
+    BACKUP_SPEC_ENV, BackupJobSpec, BackupSpec, Destination, RetentionMode,
+    SECRET_OBJECT_STORE_PREFIX,
+};
 pub use ids::{ClusterId, InstanceId, ParseInstanceIdError};
 pub use lifecycle::{InstancePhase, InstanceRole, ParsePhaseError, ParseRoleError};
 pub use manifest::{
@@ -20,4 +25,4 @@ pub use manifest::{
 };
 pub use paths::{PathLayout, container};
 pub use secret::Secret;
-pub use spec::{Bootstrap, InitdbBootstrap, InstanceSpec, SPEC_ENV, SpecError};
+pub use spec::{Bootstrap, InitdbBootstrap, InstanceSpec, RecoveryBootstrap, SPEC_ENV, SpecError};

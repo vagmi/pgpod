@@ -226,6 +226,7 @@ fn spec_for(instance: &str) -> InstanceSpec {
         shared_preload_libraries: vec![],
         network_cidr: None,
         archive_command: None,
+        backup: pgpod_core::BackupSpec::default(),
     }
 }
 

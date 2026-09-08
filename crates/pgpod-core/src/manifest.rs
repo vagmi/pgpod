@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ClusterId, InitdbBootstrap, ParseInstanceIdError};
+use crate::{BackupSpec, ClusterId, InitdbBootstrap, ParseInstanceIdError};
 
 pub const API_VERSION: &str = "pgpod/v1";
 pub const KIND: &str = "Cluster";
@@ -37,6 +37,16 @@ pub struct ClusterSpec {
     pub postgresql: PostgresqlSpec,
     #[serde(default)]
     pub storage: StorageSpec,
+    /// Object-storage destinations, retention, prefetch.
+    ///
+    /// Presence of a destination is what flips `archive_mode` from `off`
+    /// to `on` in the renderer (`pgpod_pg::ArchiveMode`), so a cluster
+    /// created *with* one archives from its very first WAL segment. It is
+    /// a postmaster-level setting, which is why adding a destination to a
+    /// cluster that already exists needs more than a reload — see
+    /// `validate`.
+    #[serde(default)]
+    pub backup: BackupSpec,
     /// UID/GID the container runs as.
     ///
     /// Exposed because it is genuinely per-image: 999 on Debian-based
@@ -125,6 +135,76 @@ impl ClusterManifest {
         if self.spec.image_name.trim().is_empty() {
             return Err(ManifestError::ImageName);
         }
+        self.validate_destinations()?;
+        Ok(())
+    }
+
+    /// Catch a malformed destination here, in the manifest, rather than
+    /// inside a container at the first `archive_command` invocation —
+    /// where the symptom is `pg_wal` filling up and the cause is three
+    /// layers away.
+    fn validate_destinations(&self) -> Result<(), ManifestError> {
+        for dest in &self.spec.backup.destinations {
+            let url = dest.url.trim();
+            let Some((scheme, rest)) = url.split_once("://") else {
+                return Err(ManifestError::Destination(format!(
+                    "{url:?} is not a URL — expected something like \
+                     gs://bucket/prefix"
+                )));
+            };
+            if rest.trim_start_matches('/').is_empty() {
+                return Err(ManifestError::Destination(format!(
+                    "{url:?} names no bucket or path"
+                )));
+            }
+            // Matching `object_store::parse_url`'s schemes. An unknown one
+            // would otherwise surface as a generic "unable to recognise
+            // URL" from three crates down.
+            const KNOWN: &[&str] = &["file", "s3", "s3a", "gs", "az", "abfs", "abfss", "memory"];
+            if !KNOWN.contains(&scheme) {
+                return Err(ManifestError::Destination(format!(
+                    "{url:?} uses an unsupported scheme {scheme:?} — pgpod \
+                     supports {}",
+                    KNOWN.join(", ")
+                )));
+            }
+
+            // A `file://` path only exists inside the container if
+            // something is mounted there. Without this check the mistake
+            // surfaces as a failing archive_command on the first segment,
+            // three layers from the manifest that caused it.
+            if scheme == "file" {
+                let mount = crate::container::ARCHIVE_MOUNT;
+                if self.spec.backup.volume.is_none() {
+                    return Err(ManifestError::Destination(format!(
+                        "{url:?} is a local path, so spec.backup.volume must name \
+                         a podman volume for pgpod to mount at {mount}"
+                    )));
+                }
+                let path = format!("/{}", rest.trim_start_matches('/'));
+                if path != mount && !path.starts_with(&format!("{mount}/")) {
+                    return Err(ManifestError::Destination(format!(
+                        "{url:?} is outside {mount}, where spec.backup.volume is \
+                         mounted — nothing else in the container is writable"
+                    )));
+                }
+            }
+        }
+
+        if self.spec.backup.volume.is_some()
+            && !self
+                .spec
+                .backup
+                .destinations
+                .iter()
+                .any(|d| d.url.trim().starts_with("file://"))
+        {
+            // A mounted volume nothing writes to looks like a working
+            // local archive and is an empty directory.
+            return Err(ManifestError::Destination(
+                "spec.backup.volume is set but no destination is a file:// URL".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -158,6 +238,9 @@ pub enum ManifestError {
 
     #[error("spec.imageName is required")]
     ImageName,
+
+    #[error("spec.backup.destinations: {0}")]
+    Destination(String),
 }
 
 #[cfg(test)]
@@ -265,6 +348,111 @@ spec:
     fn zero_instances_is_rejected() {
         let yaml = MINIMAL.replace("spec:", "spec:\n  instances: 0");
         assert!(ClusterManifest::from_yaml(&yaml).is_err());
+    }
+
+    #[test]
+    fn parses_backup_destinations() {
+        let yaml = r#"
+apiVersion: pgpod/v1
+kind: Cluster
+metadata:
+  name: mydb
+spec:
+  imageName: postgres:18
+  backup:
+    destinations:
+      - url: gs://pgpod-backups/prod
+      - url: s3://mirror/pgpod
+        endpoint: garage.internal:3900
+        region: garage
+        verifyTls: false
+    retention: 14d
+"#;
+        let m = ClusterManifest::from_yaml(yaml).unwrap();
+        assert_eq!(m.spec.backup.destinations.len(), 2);
+        assert_eq!(m.spec.backup.destinations[0].url, "gs://pgpod-backups/prod");
+        assert!(!m.spec.backup.destinations[1].verify_tls);
+        assert_eq!(m.spec.backup.retention.as_deref(), Some("14d"));
+        assert_eq!(
+            m.spec.backup.retention_mode,
+            crate::RetentionMode::Report,
+            "retention must not delete until an operator opts in"
+        );
+    }
+
+    #[test]
+    fn a_bucket_with_no_prefix_is_valid() {
+        // The cluster name is always a path component, so several
+        // clusters can share one bucket without colliding (ADR 01 §2).
+        let yaml = MINIMAL.replace(
+            "spec:",
+            "spec:\n  backup:\n    destinations:\n      - url: gs://pgpod-backups",
+        );
+        let m = ClusterManifest::from_yaml(&yaml).unwrap();
+        assert_eq!(m.spec.backup.destinations[0].url, "gs://pgpod-backups");
+    }
+
+    #[test]
+    fn a_local_destination_needs_a_volume_to_live_in() {
+        // Inside a container with a read-only rootfs, a file:// path that
+        // nothing is mounted at fails on the first archived segment.
+        let yaml = MINIMAL.replace(
+            "spec:",
+            "spec:\n  backup:\n    destinations:\n      - url: file:///archive/mydb",
+        );
+        let err = ClusterManifest::from_yaml(&yaml).unwrap_err();
+        assert!(matches!(err, ManifestError::Destination(_)), "{err}");
+        assert!(err.to_string().contains("spec.backup.volume"), "{err}");
+    }
+
+    #[test]
+    fn a_local_destination_with_its_volume_is_accepted() {
+        let yaml = MINIMAL.replace(
+            "spec:",
+            "spec:\n  backup:\n    volume: pgpod-mydb-archive\n    \
+             destinations:\n      - url: file:///archive/mydb",
+        );
+        let m = ClusterManifest::from_yaml(&yaml).unwrap();
+        assert_eq!(m.spec.backup.volume.as_deref(), Some("pgpod-mydb-archive"));
+    }
+
+    #[test]
+    fn a_local_destination_outside_the_mount_point_is_refused() {
+        // /srv/backups is not reachable from inside the container, and
+        // archiving there would write into the read-only rootfs.
+        let yaml = MINIMAL.replace(
+            "spec:",
+            "spec:\n  backup:\n    volume: v\n    destinations:\n      \
+             - url: file:///srv/backups",
+        );
+        let err = ClusterManifest::from_yaml(&yaml).unwrap_err();
+        assert!(err.to_string().contains("/archive"), "{err}");
+    }
+
+    #[test]
+    fn a_volume_with_nothing_writing_to_it_is_refused() {
+        // It would look like a working local archive and be an empty
+        // directory.
+        let yaml = MINIMAL.replace(
+            "spec:",
+            "spec:\n  backup:\n    volume: v\n    destinations:\n      \
+             - url: gs://pgpod-backups",
+        );
+        assert!(ClusterManifest::from_yaml(&yaml).is_err());
+    }
+
+    #[test]
+    fn a_malformed_destination_is_caught_in_the_manifest() {
+        // Not at the first archive_command invocation, where the symptom
+        // would be pg_wal filling up.
+        for bad in ["/srv/backups", "ftp://host/path", "gs://"] {
+            let yaml = MINIMAL.replace(
+                "spec:",
+                &format!("spec:\n  backup:\n    destinations:\n      - url: {bad}"),
+            );
+            let err = ClusterManifest::from_yaml(&yaml).unwrap_err();
+            assert!(matches!(err, ManifestError::Destination(_)), "{bad}: {err}");
+        }
     }
 
     #[test]

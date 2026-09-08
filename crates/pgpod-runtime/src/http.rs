@@ -18,8 +18,24 @@
 //! mitigation — "the blast radius is this directory" — being cashed in for
 //! the smallest possible amount.
 //!
-//! Do not add endpoints here casually. If this file starts growing, that
-//! is the signal to reconsider the client library, not to keep going.
+//! **A second endpoint now lives here, and that is a signal.** `podman-api`
+//! also cannot create a secret: `Secrets::create` posts
+//! `serde_json::to_string(&secret)`, so libpod stores the JSON *encoding*
+//! of the payload — surrounding quotes, and `\n` as two literal
+//! characters — where it wants the raw bytes. Every pgpod secret was
+//! stored that way since Phase 1, undetected because it is
+//! self-consistent: `initdb` set the password from the quoted file and
+//! later connections read the same quoted file back. It surfaced the
+//! moment something *else* had to parse a secret, and it means a secret an
+//! operator creates by hand with `podman secret create` does not match one
+//! pgpod creates.
+//!
+//! Two independent defects in the same library, both silent, both found by
+//! a test rather than by reading. Per ADR 00 §8's own warning, the next
+//! one is the point at which to replace `podman-api` rather than keep
+//! patching around it — recorded in ROADMAP.
+//!
+//! Do not add endpoints here casually.
 
 use std::path::Path;
 
@@ -30,6 +46,27 @@ use crate::error::{Error, Result};
 
 /// POST a JSON body to the libpod socket and return `(status, body)`.
 pub(crate) async fn post_json(socket: &Path, path: &str, body: &str) -> Result<(u16, String)> {
+    post(socket, path, "application/json", body.as_bytes()).await
+}
+
+/// POST raw bytes, with the content type the endpoint expects.
+///
+/// `/libpod/secrets/create` takes the secret's bytes as the body, not a
+/// JSON document containing them.
+pub(crate) async fn post_bytes(
+    socket: &Path,
+    path: &str,
+    body: &[u8],
+) -> Result<(u16, String)> {
+    post(socket, path, "application/octet-stream", body).await
+}
+
+async fn post(
+    socket: &Path,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(u16, String)> {
     let mut stream = UnixStream::connect(socket)
         .await
         .map_err(|e| Error::Unreachable(format!("connect {}: {e}", socket.display())))?;
@@ -38,21 +75,26 @@ pub(crate) async fn post_json(socket: &Path, path: &str, body: &str) -> Result<(
     // keep-alive framing. This is a one-shot call per container create, so
     // the cost of a fresh connection is irrelevant next to the pull and
     // start that follow.
-    let request = format!(
+    let head = format!(
         "POST {path} HTTP/1.1\r\n\
          Host: d\r\n\
-         Content-Type: application/json\r\n\
+         Content-Type: {content_type}\r\n\
          Content-Length: {len}\r\n\
          Connection: close\r\n\
-         \r\n\
-         {body}",
+         \r\n",
         len = body.len(),
     );
 
+    // Head and body written separately because the body is bytes, not
+    // necessarily UTF-8 — a secret is whatever the operator put in it.
     stream
-        .write_all(request.as_bytes())
+        .write_all(head.as_bytes())
         .await
         .map_err(|e| Error::Unreachable(format!("write request: {e}")))?;
+    stream
+        .write_all(body)
+        .await
+        .map_err(|e| Error::Unreachable(format!("write body: {e}")))?;
 
     let mut raw = Vec::new();
     stream

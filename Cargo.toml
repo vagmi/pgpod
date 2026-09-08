@@ -2,7 +2,7 @@
 resolver = "3"
 members = [
     "crates/pgpod-core",
-    "crates/pgpod-store",
+    "crates/pgpod-backup",
     "crates/pgpod-runtime",
     "crates/pgpod-pg",
     "crates/pgpod-registry",
@@ -22,7 +22,7 @@ repository = "https://github.com/vagmi/pgpod"
 [workspace.dependencies]
 # In-workspace crates
 pgpod-core = { path = "crates/pgpod-core" }
-pgpod-store = { path = "crates/pgpod-store" }
+pgpod-backup = { path = "crates/pgpod-backup" }
 pgpod-runtime = { path = "crates/pgpod-runtime" }
 pgpod-pg = { path = "crates/pgpod-pg" }
 pgpod-registry = { path = "crates/pgpod-registry" }
@@ -50,7 +50,14 @@ dirs = "6"
 # rather than re-picking versions per crate.
 rusqlite = { version = "0.37", features = ["bundled"] }
 refinery = { version = "0.9", features = ["rusqlite"] }
-object_store = "0.14"
+object_store = { version = "0.14", features = ["fs"] }
+url = "2"
+bytes = "1"
+# libzstd's C sources, like aws-lc-sys, compile for musl — verified for the
+# static agent build (ROADMAP Phase 2, "Derisked").
+zstd = "0.13"
+sha2 = "0.10"
+hex = "0.4"
 serde_yaml = "0.9"
 rand = "0.9"
 chrono = { version = "0.4", features = ["serde"] }

@@ -1,0 +1,52 @@
+# A cluster that backs up to a local podman volume, through pgBackRest.
+#
+# The fast loop: no network, no credentials, and the whole PITR path —
+# archive, base backup, restore --at — exercised end to end. It is what
+# `crates/pgpod-control/tests/pitr.rs` runs.
+#
+#   ops/build-agent.sh
+#   ops/build-pgbackrest.sh
+#   eval "$(ops/dev-podman.sh start)"
+#   pgpod apply -f examples/backup-local.yaml
+#   pgpod backup demo-backed-up
+#   pgpod backups demo-backed-up
+#   pgpod restore demo-backed-up --as demo-restored --at 2026-09-08T12:00:00Z
+#
+# A `file://` destination needs `spec.backup.volume`: inside a container
+# with a read-only rootfs, a local path only exists if something is mounted
+# there. pgpod mounts the named volume at /archive in every container that
+# touches the repository — the instance, the backup job, and a restored
+# instance — and podman chowns an empty named volume to the container's
+# user on first mount, which is what makes it writable at all.
+#
+# The image is the stock one. pgBackRest reaches the container as a
+# bind-mounted, self-contained bundle built by ops/build-pgbackrest.sh, so
+# no image needs rebuilding to gain backups (ADR 04 §2).
+#
+# The volume is deliberately *not* under the instance's own /pgdata, and
+# `pgpod delete --purge` does not touch it: an archive that dies with the
+# database it protects is not an archive.
+apiVersion: pgpod/v1
+kind: Cluster
+metadata:
+  name: demo-backed-up
+spec:
+  imageName: docker.io/library/postgres:18
+
+  bootstrap:
+    initdb:
+      database: appdb
+      owner: app
+
+  backup:
+    volume: pgpod-demo-archive
+    destinations:
+      - url: file:///archive/demo
+    # Retention only takes effect under `enforce`; under `report` pgpod
+    # configures none at all and pgBackRest keeps everything. Deleting
+    # backups is opt-in, deliberately (ADR 01 §6, kept by ADR 04).
+    #
+    # pgBackRest's time-based retention counts whole days, so `14d` is
+    # accepted and `48h` is refused rather than rounded.
+    retention: 14d
+    retentionMode: report

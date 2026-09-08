@@ -106,19 +106,46 @@ fn reap(postgres: Pid) -> Result<Option<i32>> {
     }
 }
 
-/// Run `f` with PostgreSQL up on the unix socket only.
+/// Wait until PostgreSQL is accepting connections on its unix socket.
+///
+/// `pg_isready` rather than the agent's own status socket: it is the
+/// narrowest check available and does not depend on pgpod's code being
+/// correct. Returns whether it got there before `timeout`.
+pub async fn wait_until_ready(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let ok = Command::new("pg_isready")
+            .args(["-h", container::SOCKET_DIR, "-U", "postgres"])
+            .args(["-p", &container::PG_PORT.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    false
+}
+
+/// Run `f` with PostgreSQL up privately.
 ///
 /// Bootstrap SQL has to run against a live server, but the instance must
-/// not be reachable over TCP while it still has `initdb`'s state — a
-/// client connecting mid-bootstrap could see a half-created role set.
-/// `listen_addresses=''` closes that window.
+/// not be reachable while it still has `initdb`'s state — a client
+/// connecting mid-bootstrap could see a half-created role set.
+/// `listen_addresses=''` closes TCP; `port` closes the unix socket too,
+/// because a unix socket's filename encodes the port. Both are needed:
+/// with only the first, `pgpod apply --wait` would see `pg_isready`
+/// succeed against *this* postmaster and report an instance ready that
+/// was about to shut down.
 pub fn with_local_postgres<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     info!("starting postgres locally for bootstrap");
     let start = Command::new("pg_ctl")
         .args(["-D", container::PGDATA, "-w", "start", "-o"])
         .arg(format!(
-            "-c listen_addresses='' -c unix_socket_directories={}",
-            container::SOCKET_DIR
+            "-c listen_addresses='' -c unix_socket_directories={} -c port={}",
+            container::SOCKET_DIR,
+            container::BOOTSTRAP_PORT
         ))
         .status()
         .context("failed to run pg_ctl start")?;
