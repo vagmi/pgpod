@@ -331,6 +331,15 @@ impl Pgpod {
             // anything. A posix repository needs neither, which is exactly
             // why leaving this out passed every local test.
             .network(cluster.network_name())
+            // This container's stdout is a *return value*, not a log:
+            // `pgbackrest info --output=json` is parsed by the control
+            // plane. Instance containers deliberately inherit the host's
+            // driver — journald on the deployment target — but routing a
+            // machine-readable document through the system journal would
+            // put noise in the operator's journal and risk journald's
+            // 48 KiB LineMax silently truncating it. The container lives
+            // for seconds and is removed straight after.
+            .log_driver("k8s-file")
             // The instance's volume: PGDATA to read, the rendered
             // pgbackrest.conf to obey, and the postgres socket to connect
             // through. One mount covers all three.

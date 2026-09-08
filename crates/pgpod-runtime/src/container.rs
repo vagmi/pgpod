@@ -127,6 +127,23 @@ pub struct ContainerSpec {
     /// none.
     pub cap_drop: Vec<String>,
     pub no_new_privileges: bool,
+    /// Override the host's log driver. `None` — the right answer for
+    /// anything an operator will ever read — inherits it.
+    ///
+    /// Instance containers must **not** set this. Their output is
+    /// PostgreSQL's log, and on a VM that belongs in journald: rotation
+    /// comes for free and the o11y agent already on the box collects it
+    /// with everything else. Overriding that would trade the operator's
+    /// story for pgpod's convenience.
+    ///
+    /// The exception is a job container whose stdout is a *return value*
+    /// rather than a log — `pgbackrest info --output=json`, which the
+    /// control plane parses. Routing a machine-readable payload through
+    /// the system journal is wrong twice over: it puts noise in the
+    /// operator's journal, and journald's `LineMax` (48 KiB by default)
+    /// silently truncates a long document, which would surface as a JSON
+    /// parse error whose cause is nowhere near the code that failed.
+    pub log_driver: Option<String>,
     /// Read-only container root filesystem. The volume and any tmpfs
     /// mounts remain writable.
     pub read_only_fs: bool,
@@ -152,6 +169,7 @@ impl ContainerSpec {
             secrets: Vec::new(),
             cap_drop: Vec::new(),
             no_new_privileges: false,
+            log_driver: None,
             read_only_fs: false,
             restart_policy: RestartPolicy::No,
             hostname: None,
@@ -216,6 +234,14 @@ impl ContainerSpec {
 
     pub fn publish(mut self, p: PortPublish) -> Self {
         self.port_publishes.push(p);
+        self
+    }
+
+    /// Send this container's output to a specific log driver instead of
+    /// the host's. See [`ContainerSpec::log_driver`] — only a job
+    /// container whose stdout is a return value should use this.
+    pub fn log_driver(mut self, driver: impl Into<String>) -> Self {
+        self.log_driver = Some(driver.into());
         self
     }
 
@@ -298,6 +324,57 @@ impl ContainerProbe {
             .iter()
             .find_map(|e| e.strip_prefix(prefix.as_str()))
     }
+}
+
+/// Correct libpod's create payload after `podman-api` has built it.
+///
+/// Pure, and separated out so both corrections can be asserted without a
+/// podman socket. Each exists because `podman-api` gets a field wrong in a
+/// way that is *silent* — libpod ignores what it does not recognise — so
+/// nothing fails, the setting simply never applies.
+fn patch_create_payload(
+    mut json: serde_json::Value,
+    no_new_privileges: bool,
+    log_driver: Option<&str>,
+) -> Result<serde_json::Value> {
+    let obj = json
+        .as_object_mut()
+        .ok_or_else(|| Error::Container("create payload is not an object".into()))?;
+
+    if no_new_privileges {
+        // `podman-api`'s builder spells it `no_new_privilages` (a typo in
+        // both 0.10 and 0.11). Drop the misspelling so libpod is not left
+        // with a stray unknown field, then set the key it reads.
+        obj.remove("no_new_privilages");
+        obj.insert(
+            "no_new_privileges".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+
+    // The log driver is *not* pinned here. Container output goes wherever
+    // the host sends it — journald on Ubuntu 26.04 — because that is what
+    // gives an operator log rotation for free and lets whatever o11y agent
+    // already runs on the machine collect PostgreSQL's output alongside
+    // everything else. Overriding that would be a regression against the
+    // whole point of running PostgreSQL on a VM rather than in Kubernetes.
+    //
+    // Reading logs back is a *permissions* problem, not a driver problem:
+    // rootless podman writes journald entries the service user must be in
+    // `systemd-journal` to read. `ops/provision-node.sh` grants it. Without
+    // that, `podman logs` returns an empty stream and no error — which is
+    // how this was first mistaken for a broken driver.
+    //
+    // `ContainerSpec::log_driver` exists for the one case that genuinely
+    // is not an operator log; see its documentation.
+    if let Some(driver) = log_driver {
+        obj.insert(
+            "log_configuration".to_string(),
+            serde_json::json!({ "driver": driver }),
+        );
+    }
+
+    Ok(serde_json::Value::Object(obj.clone()))
 }
 
 impl PodmanClient {
@@ -473,29 +550,18 @@ impl PodmanClient {
             b = b.mounts(oci_mounts);
         }
 
-        // podman-api builds the payload; we post it ourselves so the one
-        // key its builder misspells actually lands. See `http.rs` for why
-        // this detour exists and why it must not grow.
+        // podman-api builds the payload; we post it ourselves so the keys
+        // its builder gets wrong actually land. See `http.rs` for why this
+        // detour exists and why it must not grow.
         let opts = b.build();
         let payload = opts
             .serialize()
             .map_err(|e| Error::Container(format!("serialize create options: {e}")))?;
-        let mut json: serde_json::Value = serde_json::from_str(&payload)
+        let json: serde_json::Value = serde_json::from_str(&payload)
             .map_err(|e| Error::Container(format!("re-parse create options: {e}")))?;
 
-        if spec.no_new_privileges {
-            let obj = json
-                .as_object_mut()
-                .ok_or_else(|| Error::Container("create payload is not an object".into()))?;
-            // Drop the typo'd key so podman is not left with a stray
-            // unknown field, then set the one it actually reads.
-            obj.remove("no_new_privilages");
-            obj.insert(
-                "no_new_privileges".to_string(),
-                serde_json::Value::Bool(true),
-            );
-            json = serde_json::Value::Object(obj.clone());
-        }
+        let json =
+            patch_create_payload(json, spec.no_new_privileges, spec.log_driver.as_deref())?;
 
         let body = json.to_string();
         let (status, response) = crate::http::post_json(
@@ -660,6 +726,90 @@ impl Container {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The payload `podman-api` hands us, near enough: it has the typo'd
+    /// key and no log configuration at all.
+    fn built_payload() -> serde_json::Value {
+        serde_json::json!({
+            "image": "postgres:18",
+            "name": "pgpod-mydb-1",
+            "no_new_privilages": true,
+        })
+    }
+
+    #[test]
+    fn the_misspelled_hardening_key_is_replaced_not_merely_added() {
+        // Leaving `no_new_privilages` behind would mean libpod carries an
+        // unknown field forever, and would hide the fact that the builder
+        // is wrong from anyone reading the wire payload.
+        let out = patch_create_payload(built_payload(), true, None).unwrap();
+        assert_eq!(out.get("no_new_privileges"), Some(&serde_json::json!(true)));
+        assert!(
+            out.get("no_new_privilages").is_none(),
+            "the typo'd key must be removed: {out}"
+        );
+    }
+
+    #[test]
+    fn hardening_is_not_asserted_when_it_was_not_asked_for() {
+        let out = patch_create_payload(built_payload(), false, None).unwrap();
+        assert!(out.get("no_new_privileges").is_none(), "{out}");
+    }
+
+    #[test]
+    fn a_container_inherits_the_host_log_driver_by_default() {
+        // PostgreSQL's output belongs wherever the host sends it —
+        // journald on the deployment target, which is what gives an
+        // operator rotation and lets an o11y agent collect it. pgpod must
+        // not override that for its own convenience.
+        let out = patch_create_payload(built_payload(), true, None).unwrap();
+        assert!(
+            out.get("log_configuration").is_none(),
+            "pgpod must not pin a log driver on instance containers: {out}"
+        );
+    }
+
+    #[test]
+    fn a_job_container_can_opt_out_of_the_host_driver() {
+        // Inheriting the host default silently breaks `pgpod logs`, the
+        // JSON `pgbackrest info` prints from a job container, and the
+        // container-logs detail on a readiness failure. Ubuntu 26.04's
+        // podman 5.7 defaults to `journald`, where a rootless
+        // `podman logs` returns an empty stream and no error; Arch's 6.1
+        // defaults to `k8s-file`, which is why it went unnoticed until
+        // pgpod ran on its own deployment target.
+        // Only for output that is a return value rather than a log:
+        // `pgbackrest info --output=json`, which the control plane parses
+        // and journald's LineMax would truncate.
+        for hardened in [true, false] {
+            let out =
+                patch_create_payload(built_payload(), hardened, Some("k8s-file")).unwrap();
+            assert_eq!(
+                out.pointer("/log_configuration/driver"),
+                Some(&serde_json::json!("k8s-file")),
+                "an explicit driver must survive regardless of hardening: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_log_driver_uses_libpods_shape_not_dockers() {
+        // `podman-api`'s `log_configuration` serializes the Docker-compat
+        // `{"Config","Type"}` object; libpod's create endpoint reads
+        // `{"driver": ...}` and ignores the other silently.
+        let out = patch_create_payload(built_payload(), true, Some("k8s-file")).unwrap();
+        let cfg = out.get("log_configuration").expect("log_configuration");
+        assert!(cfg.get("driver").is_some(), "{cfg}");
+        assert!(cfg.get("Type").is_none(), "Docker-compat shape: {cfg}");
+        assert!(cfg.get("Config").is_none(), "Docker-compat shape: {cfg}");
+    }
+
+    #[test]
+    fn nothing_else_in_the_payload_is_disturbed() {
+        let out = patch_create_payload(built_payload(), true, None).unwrap();
+        assert_eq!(out.get("image"), Some(&serde_json::json!("postgres:18")));
+        assert_eq!(out.get("name"), Some(&serde_json::json!("pgpod-mydb-1")));
+    }
 
     #[test]
     fn spec_builder_composes() {

@@ -92,12 +92,43 @@ render_user_data() {
 
 # libvirt's osinfo-db may predate 26.04. Falling back keeps `create`
 # working on an older host instead of failing on a cosmetic hint.
+#
+# Two things here were wrong and both failed the same way — silently
+# choosing a fallback that virt-install then rejected, so `create` had
+# never worked on any host:
+#
+#   * `osinfo-query os short-id` is not a column selector. osinfo-query
+#     reads trailing words as `KEY=VALUE` filter conditions, so that
+#     spelling exits with "Unable to construct filter" and prints nothing.
+#     The test therefore always failed, even where the id existed. The
+#     column flag is `-f`.
+#   * `ubuntulatest` is not an osinfo id. The real aliases are
+#     `ubuntu-lts-latest` and `ubuntu-stable-latest`.
+#
+# `virt-install --osinfo list` is asked rather than osinfo-query, because
+# virt-install is the thing that has to accept the answer — and it lists
+# aliases (`ubuntu26.04, ubunturesolute`) that osinfo-query's short-id
+# column does not.
 resolve_os_variant() {
-  if osinfo-query os short-id 2>/dev/null | grep -qx "$OS_VARIANT"; then
-    echo "$OS_VARIANT"
-  else
-    echo "ubuntulatest"
+  local known candidate
+  known=$(virt-install --osinfo list 2>/dev/null | tr ',' '\n' | tr -d ' ')
+  if [ -z "$known" ]; then
+    # No osinfo at all: let virt-install decide rather than guessing, and
+    # say so, because the guest may get generic virtio defaults.
+    echo "generic"
+    return
   fi
+
+  # Most specific first. `generic` last: it always exists, and it is
+  # better than failing, but it disables the device tuning osinfo exists
+  # to provide.
+  for candidate in "$OS_VARIANT" ubuntu-lts-latest linux2024 linux2022 generic; do
+    if printf '%s\n' "$known" | grep -qx "$candidate"; then
+      echo "$candidate"
+      return
+    fi
+  done
+  echo "generic"
 }
 
 # ---------- commands ----------

@@ -66,6 +66,37 @@ fi
 # user's own. PostgreSQL runs as 999 (or 26 on CNPG-style images), so
 # without them no instance can start. `useradd` populates them on some
 # Ubuntu builds and not others — assert rather than hope.
+# Container logs go to journald, which is the point: the operator gets
+# rotation for free and whatever o11y agent already runs on the box can
+# collect PostgreSQL's output alongside everything else. Reading them back
+# — `podman logs`, and so `pgpod logs` — needs journal read permission,
+# which a freshly created system user does not have. Without this,
+# `podman logs` returns an empty stream and no error, and every pgpod
+# diagnostic that quotes container output says nothing.
+log "granting ${PGPOD_USER} journal read access"
+usermod -aG systemd-journal "${PGPOD_USER}"
+
+# Supplementary groups are read once, when a process starts. `podman` is
+# socket-activated by the *user manager* (`user@<uid>.service`), so if that
+# manager was already running when the group was added it keeps the old
+# set and every container's logs stay unreadable — through the API, which
+# is what pgpod uses. `podman logs` run directly on the host still works,
+# reading the journal in-process, which makes this maddening to diagnose.
+#
+# Restart the manager when it is running without the group. Containers do
+# not survive it, which is why this only fires when something actually
+# needs fixing.
+JOURNAL_GID="$(getent group systemd-journal | cut -d: -f3)"
+_UID="$(id -u "${PGPOD_USER}")"
+MANAGER_PID="$(systemctl show "user@${_UID}.service" -p MainPID --value 2>/dev/null || echo 0)"
+if [ "${MANAGER_PID:-0}" != "0" ] \
+   && ! grep -qE "^Groups:.*(^|[[:space:]])${JOURNAL_GID}([[:space:]]|$)" \
+        "/proc/${MANAGER_PID}/status" 2>/dev/null; then
+  log "restarting the user manager so it picks up the journal group"
+  echo "   (this stops running containers; re-apply afterwards)" >&2
+  systemctl restart "user@${_UID}.service"
+fi
+
 log "ensuring subuid/subgid ranges for ${PGPOD_USER}"
 if ! grep -q "^${PGPOD_USER}:" /etc/subuid; then
   echo "${PGPOD_USER}:${SUBID_START}:${SUBID_COUNT}" >> /etc/subuid
@@ -103,30 +134,52 @@ log "enabling podman.socket under ${PGPOD_USER}"
 # XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS stay unset and
 # `systemctl --user` fails with "Failed to connect to user scope bus".
 # Setting them explicitly is deterministic across releases (adrs/03 §2).
+#
+# `cd` first, because `-H` sets HOME but **not** the working directory:
+# the shell starts in whatever directory invoked this script, and if that
+# is another user's home — `/home/ubuntu`, running this over ssh, which is
+# the normal case — anything that touches cwd fails with
+# "cannot chdir to /home/ubuntu: Permission denied". `systemctl` does not
+# care; podman does.
+#
 # Kept on one line — newlines get mangled through the nested shells.
 sudo -Hu "${PGPOD_USER}" bash -c \
-  "export XDG_RUNTIME_DIR=/run/user/${PGPOD_UID} && export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${PGPOD_UID}/bus && systemctl --user daemon-reload && systemctl --user enable --now podman.socket && ls -l /run/user/${PGPOD_UID}/podman/podman.sock"
+  "cd ${PGPOD_HOME} && export XDG_RUNTIME_DIR=/run/user/${PGPOD_UID} && export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${PGPOD_UID}/bus && systemctl --user daemon-reload && systemctl --user enable --now podman.socket && ls -l /run/user/${PGPOD_UID}/podman/podman.sock"
 
 # ---------------------------------------------------------------------------
 # 5. Report
 # ---------------------------------------------------------------------------
 
 log "podman info for ${PGPOD_USER}"
+# Read through JSON and `jq` rather than a Go `--format` template.
+# Templates address podman's *internal Go struct fields*, which are not a
+# stable interface: `.Host.CgroupVersion` exists on 6.1 and does not on
+# 5.7, where the same call dies with
+#   can't evaluate field CgroupVersion in type *define.HostInfo
+# The JSON keys (`.host.cgroupVersion`) are the same on both. This script
+# already installs jq, and pgpod's own `PodmanInfo` parses the same JSON —
+# so the report and the product agree by construction.
 sudo -Hu "${PGPOD_USER}" bash -c \
-  "export XDG_RUNTIME_DIR=/run/user/${PGPOD_UID} && podman info --format 'graphRoot: {{.Store.GraphRoot}}
-runRoot:   {{.Store.RunRoot}}
-backend:   {{.Host.NetworkBackend}}
-runtime:   {{.Host.OCIRuntime.Name}}
-cgroups:   v{{.Host.CgroupVersion}}
-rootless:  {{.Host.Security.Rootless}}
-distro:    {{.Host.Distribution.Distribution}} {{.Host.Distribution.Version}}'"
+  "cd ${PGPOD_HOME} && export XDG_RUNTIME_DIR=/run/user/${PGPOD_UID} && podman info --format json" \
+  | jq -r '
+      "graphRoot: \(.store.graphRoot)",
+      "runRoot:   \(.store.runRoot)",
+      "backend:   \(.host.networkBackend)",
+      "runtime:   \(.host.ociRuntime.name)",
+      "cgroups:   \(.host.cgroupVersion) (\(.host.cgroupManager))",
+      "rootless:  \(.host.security.rootless)",
+      "distro:    \(.host.distribution.distribution) \(.host.distribution.version)"'
 
 log "provisioning complete"
 cat <<HINT
 Next: install the pgpod binary and run its own preflight, which checks
 rather more than the summary above:
 
-  sudo -Hu ${PGPOD_USER} env XDG_RUNTIME_DIR=/run/user/${PGPOD_UID} pgpod doctor
+  cd ${PGPOD_HOME} && sudo -Hu ${PGPOD_USER} \
+    env XDG_RUNTIME_DIR=/run/user/${PGPOD_UID} pgpod doctor
+
+(the \`cd\` matters: \`sudo -H\` sets HOME but not the working directory, and
+${PGPOD_USER} cannot read the home directory you are probably sitting in)
 
 NOTE: podman volumes now hold PostgreSQL data directories, so the graph
 root above is where your databases live. If it is on a small filesystem,
