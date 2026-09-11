@@ -18,7 +18,9 @@ mod schema {
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pgpod_core::{ClusterId, ClusterManifest, InstancePhase, InstanceRole};
+use pgpod_core::{
+    ClusterId, ClusterManifest, InstancePhase, InstanceRole, PoolerId, PoolerManifest,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +39,16 @@ pub enum Error {
 
     #[error("cluster {0} is not known to pgpod")]
     UnknownCluster(String),
+
+    #[error("pooler {0} is not known to pgpod")]
+    UnknownPooler(String),
+
+    #[error(
+        "cluster {cluster} is still fronted by pooler {pooler}. Delete the \
+         pooler first (`pgpod pooler delete {pooler}`), or it would be left \
+         accepting connections for a cluster that no longer exists."
+    )]
+    PoolerInUse { cluster: String, pooler: String },
 
     #[error("stored data is corrupt: {0}")]
     Corrupt(String),
@@ -68,6 +80,32 @@ pub struct InstanceRecord {
     pub role: InstanceRole,
     pub timeline: Option<i64>,
     pub last_probe_at_ms: Option<i64>,
+}
+
+/// The `poolers` columns, as SQLite hands them back.
+type PoolerRow = (String, String, i64, String, Option<String>, i64, String);
+
+/// One pooler's persisted row.
+#[derive(Debug, Clone)]
+pub struct PoolerRecord {
+    pub name: String,
+    pub manifest: PoolerManifest,
+    pub generation: i64,
+    pub container_name: String,
+    pub container_id: Option<String>,
+    pub host_port: u16,
+    pub phase: String,
+    /// Which clusters it fronts, and under what pool names.
+    pub pools: Vec<PoolerPool>,
+}
+
+/// One pool a pooler exports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolerPool {
+    pub cluster: String,
+    pub database: String,
+    /// What clients put in `dbname`.
+    pub pool_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +265,24 @@ impl Registry {
     /// Deletes *rows*, never volumes. A registry row is bookkeeping; a
     /// volume is a database (`AGENTS.md` principle 4).
     pub fn delete_cluster(&self, cluster: &ClusterId) -> Result<()> {
+        // `pooler_clusters` references this row ON DELETE RESTRICT, so
+        // SQLite would refuse anyway — with "FOREIGN KEY constraint
+        // failed", which names neither the cluster nor the pooler holding
+        // it. Checked here so the operator is told what to delete first.
+        if let Some(pooler) = self
+            .conn
+            .query_row(
+                "SELECT pooler FROM pooler_clusters WHERE cluster = ?1 LIMIT 1",
+                params![cluster.as_str()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Err(Error::PoolerInUse {
+                cluster: cluster.to_string(),
+                pooler,
+            });
+        }
         self.conn.execute(
             "DELETE FROM clusters WHERE name = ?1",
             params![cluster.as_str()],
@@ -318,6 +374,210 @@ impl Registry {
             .instances(cluster)?
             .into_iter()
             .find(|i| i.ordinal == ordinal))
+    }
+
+    // ---- poolers -----------------------------------------------------
+
+    /// Insert or update a pooler and the pools it exports.
+    ///
+    /// The pool rows are replaced wholesale rather than diffed: they are
+    /// derived from the manifest, so anything in the table that is not in
+    /// the manifest is stale by definition. Done in one transaction, so a
+    /// crash cannot leave a pooler advertising pools it no longer has.
+    pub fn put_pooler(
+        &self,
+        manifest: &PoolerManifest,
+        container_name: &str,
+        container_id: Option<&str>,
+        host_port: u16,
+        phase: &str,
+        pools: &[PoolerPool],
+    ) -> Result<i64> {
+        let name = manifest.metadata.name.clone();
+        let encoded = serde_json::to_string(manifest)
+            .map_err(|e| Error::Corrupt(format!("could not encode pooler manifest: {e}")))?;
+        let now = now_ms();
+        // `unchecked_transaction` because `Pgpod` holds the registry
+        // behind a shared reference — the borrow checker cannot see that
+        // there is one connection, but SQLite's own locking does.
+        let tx = self.conn.unchecked_transaction()?;
+
+        let existing: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT manifest, generation FROM poolers WHERE name = ?1",
+                params![name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        let generation = match existing {
+            None => {
+                tx.execute(
+                    "INSERT INTO poolers (name, manifest, generation, container_name,
+                         container_id, host_port, phase, created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?7)",
+                    params![
+                        name,
+                        encoded,
+                        container_name,
+                        container_id,
+                        host_port,
+                        phase,
+                        now
+                    ],
+                )?;
+                1
+            }
+            Some((stored, prev)) => {
+                let generation = if stored == encoded { prev } else { prev + 1 };
+                tx.execute(
+                    "UPDATE poolers SET manifest = ?2, generation = ?3, container_name = ?4,
+                         container_id = ?5, host_port = ?6, phase = ?7, updated_at_ms = ?8
+                     WHERE name = ?1",
+                    params![
+                        name,
+                        encoded,
+                        generation,
+                        container_name,
+                        container_id,
+                        host_port,
+                        phase,
+                        now
+                    ],
+                )?;
+                generation
+            }
+        };
+
+        tx.execute(
+            "DELETE FROM pooler_clusters WHERE pooler = ?1",
+            params![name],
+        )?;
+        for pool in pools {
+            tx.execute(
+                "INSERT INTO pooler_clusters (pooler, cluster, database, pool_name)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![name, pool.cluster, pool.database, pool.pool_name],
+            )?;
+        }
+        tx.commit()?;
+        Ok(generation)
+    }
+
+    pub fn pooler(&self, pooler: &PoolerId) -> Result<Option<PoolerRecord>> {
+        let row: Option<PoolerRow> = self
+            .conn
+            .query_row(
+                "SELECT name, manifest, generation, container_name, container_id,
+                        host_port, phase
+                 FROM poolers WHERE name = ?1",
+                params![pooler.as_str()],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((name, manifest, generation, container_name, container_id, host_port, phase)) =
+            row
+        else {
+            return Ok(None);
+        };
+        Ok(Some(PoolerRecord {
+            manifest: serde_json::from_str(&manifest)
+                .map_err(|e| Error::Corrupt(format!("stored pooler manifest: {e}")))?,
+            pools: self.pools_of(&name)?,
+            name,
+            generation,
+            container_name,
+            container_id,
+            host_port: host_port as u16,
+            phase,
+        }))
+    }
+
+    pub fn require_pooler(&self, pooler: &PoolerId) -> Result<PoolerRecord> {
+        self.pooler(pooler)?
+            .ok_or_else(|| Error::UnknownPooler(pooler.to_string()))
+    }
+
+    fn pools_of(&self, pooler: &str) -> Result<Vec<PoolerPool>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cluster, database, pool_name FROM pooler_clusters
+             WHERE pooler = ?1 ORDER BY pool_name",
+        )?;
+        let rows = stmt
+            .query_map(params![pooler], |r| {
+                Ok(PoolerPool {
+                    cluster: r.get(0)?,
+                    database: r.get(1)?,
+                    pool_name: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_poolers(&self) -> Result<Vec<PoolerRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM poolers ORDER BY name")?;
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        names
+            .into_iter()
+            .map(|n| {
+                let id = PoolerId::new(n.clone())
+                    .map_err(|e| Error::Corrupt(format!("stored pooler name {n:?}: {e}")))?;
+                self.require_pooler(&id)
+            })
+            .collect()
+    }
+
+    /// Every pooler fronting a cluster.
+    ///
+    /// What a switchover consults to find the pools to hold, and what
+    /// `delete` consults to refuse.
+    pub fn poolers_for_cluster(&self, cluster: &ClusterId) -> Result<Vec<PoolerRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT pooler FROM pooler_clusters WHERE cluster = ?1 ORDER BY pooler",
+        )?;
+        let names: Vec<String> = stmt
+            .query_map(params![cluster.as_str()], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        names
+            .into_iter()
+            .map(|n| {
+                let id = PoolerId::new(n.clone())
+                    .map_err(|e| Error::Corrupt(format!("stored pooler name {n:?}: {e}")))?;
+                self.require_pooler(&id)
+            })
+            .collect()
+    }
+
+    pub fn set_pooler_phase(&self, pooler: &PoolerId, phase: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE poolers SET phase = ?2, updated_at_ms = ?3 WHERE name = ?1",
+            params![pooler.as_str(), phase, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_pooler(&self, pooler: &PoolerId) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM poolers WHERE name = ?1",
+            params![pooler.as_str()],
+        )?;
+        Ok(())
     }
 
     // ---- events ------------------------------------------------------
@@ -540,5 +800,236 @@ mod tests {
             assert_eq!(stored.phase, phase);
             assert_eq!(stored.role, InstanceRole::Standby);
         }
+    }
+
+    // ---- poolers -----------------------------------------------------
+
+    fn pooler_manifest(name: &str, clusters: &[&str]) -> PoolerManifest {
+        let mut yaml = format!(
+            "apiVersion: pgpod/v1\nkind: Pooler\nmetadata:\n  name: {name}\nspec:\n  clusters:\n"
+        );
+        for (i, c) in clusters.iter().enumerate() {
+            yaml.push_str(&format!(
+                "    - cluster: {c}\n      pools:\n        - database: appdb\n          as: pool{i}\n"
+            ));
+        }
+        PoolerManifest::from_yaml(&yaml).unwrap()
+    }
+
+    fn pool(cluster: &str, name: &str) -> PoolerPool {
+        PoolerPool {
+            cluster: cluster.into(),
+            database: "appdb".into(),
+            pool_name: name.into(),
+        }
+    }
+
+    fn pid(name: &str) -> PoolerId {
+        PoolerId::new(name).unwrap()
+    }
+
+    fn with_cluster(names: &[&str]) -> Registry {
+        let r = registry();
+        for n in names {
+            r.put_cluster(&manifest(n, "postgres:18"), "running")
+                .unwrap();
+        }
+        r
+    }
+
+    #[test]
+    fn a_pooler_round_trips_with_its_pools() {
+        let r = with_cluster(&["mydb"]);
+        let m = pooler_manifest("app", &["mydb"]);
+        let generation = r
+            .put_pooler(
+                &m,
+                "pgpod-pooler-app",
+                Some("abc"),
+                6432,
+                "running",
+                &[pool("mydb", "pool0")],
+            )
+            .unwrap();
+        assert_eq!(generation, 1);
+
+        let stored = r.require_pooler(&pid("app")).unwrap();
+        assert_eq!(stored.container_name, "pgpod-pooler-app");
+        assert_eq!(stored.container_id.as_deref(), Some("abc"));
+        assert_eq!(stored.host_port, 6432);
+        assert_eq!(stored.pools, vec![pool("mydb", "pool0")]);
+        assert_eq!(stored.manifest, m);
+    }
+
+    #[test]
+    fn re_applying_an_unchanged_pooler_does_not_bump_the_generation() {
+        // Same contract as clusters: a reconciler tells "spec changed"
+        // from "nothing to do" without diffing JSON itself.
+        let r = with_cluster(&["mydb"]);
+        let m = pooler_manifest("app", &["mydb"]);
+        let pools = [pool("mydb", "pool0")];
+        assert_eq!(
+            r.put_pooler(&m, "c", None, 6432, "running", &pools)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            r.put_pooler(&m, "c", None, 6432, "running", &pools)
+                .unwrap(),
+            1
+        );
+
+        let changed = pooler_manifest("app", &["mydb", "other"]);
+        r.put_cluster(&manifest("other", "postgres:18"), "running")
+            .unwrap();
+        assert_eq!(
+            r.put_pooler(
+                &changed,
+                "c",
+                None,
+                6432,
+                "running",
+                &[pool("mydb", "pool0"), pool("other", "pool1")]
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn pool_rows_are_replaced_wholesale_not_merged() {
+        // They are derived from the manifest, so a row the manifest no
+        // longer mentions is stale by definition — and a pooler
+        // advertising a pool it does not serve would hold a cluster that
+        // is not there.
+        let r = with_cluster(&["mydb", "other"]);
+        r.put_pooler(
+            &pooler_manifest("app", &["mydb", "other"]),
+            "c",
+            None,
+            6432,
+            "running",
+            &[pool("mydb", "pool0"), pool("other", "pool1")],
+        )
+        .unwrap();
+        r.put_pooler(
+            &pooler_manifest("app", &["mydb"]),
+            "c",
+            None,
+            6432,
+            "running",
+            &[pool("mydb", "pool0")],
+        )
+        .unwrap();
+        let stored = r.require_pooler(&pid("app")).unwrap();
+        assert_eq!(stored.pools, vec![pool("mydb", "pool0")]);
+    }
+
+    #[test]
+    fn poolers_are_findable_by_the_cluster_they_front() {
+        // What a switchover consults to find the pools to hold.
+        let r = with_cluster(&["mydb", "other"]);
+        r.put_pooler(
+            &pooler_manifest("shared", &["mydb", "other"]),
+            "c1",
+            None,
+            6432,
+            "running",
+            &[pool("mydb", "pool0"), pool("other", "pool1")],
+        )
+        .unwrap();
+        r.put_pooler(
+            &pooler_manifest("solo", &["mydb"]),
+            "c2",
+            None,
+            6433,
+            "running",
+            &[pool("mydb", "solo-appdb")],
+        )
+        .unwrap();
+
+        let names: Vec<String> = r
+            .poolers_for_cluster(&id("mydb"))
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, vec!["shared".to_string(), "solo".to_string()]);
+        assert_eq!(r.poolers_for_cluster(&id("other")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleting_a_cluster_a_pooler_fronts_is_refused_by_name() {
+        // SQLite would refuse this anyway, with "FOREIGN KEY constraint
+        // failed" — which names neither the cluster nor the pooler, and
+        // leaves the operator with nothing to act on.
+        let r = with_cluster(&["mydb"]);
+        r.put_pooler(
+            &pooler_manifest("app", &["mydb"]),
+            "c",
+            None,
+            6432,
+            "running",
+            &[pool("mydb", "pool0")],
+        )
+        .unwrap();
+
+        let err = r.delete_cluster(&id("mydb")).unwrap_err();
+        assert!(matches!(err, Error::PoolerInUse { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("mydb") && msg.contains("app"), "{msg}");
+        assert!(
+            msg.contains("pgpod pooler delete"),
+            "the message must name the fix: {msg}"
+        );
+
+        // And once the pooler is gone, the cluster deletes normally.
+        r.delete_pooler(&pid("app")).unwrap();
+        r.delete_cluster(&id("mydb")).unwrap();
+        assert!(r.list_clusters().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_pooler_takes_its_pool_rows_with_it() {
+        let r = with_cluster(&["mydb"]);
+        r.put_pooler(
+            &pooler_manifest("app", &["mydb"]),
+            "c",
+            None,
+            6432,
+            "running",
+            &[pool("mydb", "pool0")],
+        )
+        .unwrap();
+        r.delete_pooler(&pid("app")).unwrap();
+        assert!(r.pooler(&pid("app")).unwrap().is_none());
+        assert!(r.poolers_for_cluster(&id("mydb")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn two_pools_cannot_share_a_name_within_one_pooler() {
+        // Enforced durably, not only at manifest parse time: the pool name
+        // is what a client puts in dbname.
+        let r = with_cluster(&["mydb", "other"]);
+        let err = r.put_pooler(
+            &pooler_manifest("app", &["mydb", "other"]),
+            "c",
+            None,
+            6432,
+            "running",
+            &[pool("mydb", "same"), pool("other", "same")],
+        );
+        assert!(err.is_err(), "duplicate pool names must be refused");
+        // The failed insert must not have left a half-written pooler.
+        assert!(r.pooler(&pid("app")).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unknown_pooler_is_a_distinct_error() {
+        let r = registry();
+        assert!(matches!(
+            r.require_pooler(&pid("nope")).unwrap_err(),
+            Error::UnknownPooler(_)
+        ));
     }
 }

@@ -297,6 +297,78 @@ async fn a_cluster_can_be_restored_to_a_point_in_time() {
         "f",
         "recovery_target_action = promote means the restore ends usable"
     );
+
+    // ---- the restored cluster's credentials are the source's ----------
+    //
+    // A restore brings `pg_authid` with it, and the restore path
+    // deliberately does not rewrite roles — restoring a database "as it
+    // was" includes its passwords. pgpod used to generate *fresh* secrets
+    // for the restored cluster anyway, so the password it stored was one
+    // no role had: the `postgresql://app@…` URI in `pgpod status` could
+    // not be used, and nothing said why, because every test connected
+    // over the unix socket with `peer` and never touched a password.
+    //
+    // Asserted against the database rather than by comparing two secrets,
+    // because equal secrets that both fail to authenticate would pass
+    // that test and leave the operator exactly where they started.
+    let app_password = sql(
+        &pg,
+        &restored_instance,
+        "postgres",
+        &format!(
+            "SELECT pg_read_file('{}')",
+            pgpod_core::container::SECRET_APP_OWNER
+        ),
+    )
+    .await;
+    let source_password = sql(
+        &pg,
+        &instance,
+        "postgres",
+        &format!(
+            "SELECT pg_read_file('{}')",
+            pgpod_core::container::SECRET_APP_OWNER
+        ),
+    )
+    .await;
+    assert_eq!(
+        app_password, source_password,
+        "the restored cluster must adopt the source's credentials, not \
+         generate its own — its roles came from the backup"
+    );
+
+    // And it actually authenticates, over TCP, which is the path `peer`
+    // was hiding.
+    let restored_id: pgpod_core::InstanceId = restored_instance.parse().expect("instance id");
+    let out = pg
+        .running_container(&restored_id)
+        .await
+        .expect("restored instance running")
+        .exec(
+            &ExecSpec::new([
+                "psql",
+                "-X",
+                "-tA",
+                "-h",
+                "127.0.0.1",
+                "-U",
+                "app",
+                "-d",
+                "appdb",
+                "-c",
+                "SELECT current_user",
+            ])
+            .env("PGPASSWORD", app_password.trim()),
+        )
+        .await
+        .expect("exec psql");
+    assert!(
+        out.success() && out.stdout.trim() == "app",
+        "the stored app-owner secret does not authenticate against the \
+         restored cluster: {}{}",
+        out.stdout.trim(),
+        out.stderr.trim()
+    );
     sql(
         &pg,
         &restored_instance,
@@ -485,7 +557,13 @@ spec:
         "CREATE TABLE t (id int primary key, tag text)",
     )
     .await;
-    sql(&pg, &instance, "appdb", "INSERT INTO t VALUES (1, 'before')").await;
+    sql(
+        &pg,
+        &instance,
+        "appdb",
+        "INSERT INTO t VALUES (1, 'before')",
+    )
+    .await;
 
     // The backup itself is the point: this writes over TLS to Garage,
     // which a posix repository never exercises.
@@ -578,4 +656,177 @@ async fn scrub(pg: &Pgpod, clusters: &[&str]) {
             let _ = podman.remove_secret(&format!("pgpod-{c}-{suffix}")).await;
         }
     }
+}
+
+/// Restoring where the source's secrets are **not** on this host.
+///
+/// The fresh-machine restore ADR 04 §5 exists to support: the repository
+/// is self-describing, so the backup is all you brought. Its roles carry
+/// passwords nobody here knows, and pgpod cannot adopt a credential that
+/// does not exist — so it generates one and *rotates the role to match*,
+/// because a restore that returns an unreachable cluster is not a restore.
+///
+/// Simulated by removing the source cluster's podman secrets, which is
+/// exactly the condition `ensure_secrets` tests for.
+///
+/// **This test passed before the code was correct**, and it is worth
+/// knowing why. Rotation needs a *writable* cluster, but `wait_ready`
+/// polls `pg_isready`, which succeeds while a restore is still replaying
+/// and has not yet promoted. Against this small archive the promotion won
+/// the race every time; against a real one on the deployment target it
+/// lost, with `cannot execute ALTER ROLE in a read-only transaction`. The
+/// `wait_writable` call in `rotate_restored_roles` is what closes it —
+/// this test cannot be relied on to catch its removal.
+#[tokio::test]
+async fn a_restore_without_the_source_secrets_rotates_the_roles() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pg = pgpod(dir.path());
+
+    let suffix = std::process::id() % 100_000;
+    let name = format!("f{suffix}");
+    let restored_name = format!("f{suffix}r");
+    let archive_volume = format!("pgpod-{name}-archive");
+    let cluster = ClusterId::new(name.clone()).unwrap();
+    let restored = ClusterId::new(restored_name.clone()).unwrap();
+
+    let _ = pg.delete(&cluster, true).await;
+    let _ = pg.delete(&restored, true).await;
+    let _ = pg
+        .podman_client()
+        .remove_volume_destroying_data(&archive_volume)
+        .await;
+
+    pg.apply(&manifest(&name, &archive_volume), READY_TIMEOUT)
+        .await
+        .expect("apply");
+    let instance = format!("{name}-1");
+    sql(
+        &pg,
+        &instance,
+        "appdb",
+        "CREATE TABLE t (id int primary key)",
+    )
+    .await;
+    sql(&pg, &instance, "appdb", "INSERT INTO t VALUES (1)").await;
+    pg.backup(&cluster, BACKUP_TIMEOUT).await.expect("backup");
+
+    // The source's credentials leave the host. The running container keeps
+    // the files podman already materialised, so the source stays up — only
+    // pgpod's ability to read them back is gone, which is the whole
+    // condition under test.
+    for secret in pgpod_control::SecretNames::for_cluster(&cluster).all() {
+        pg.podman_client()
+            .remove_secret(secret)
+            .await
+            .unwrap_or_else(|e| panic!("remove {secret}: {e}"));
+    }
+
+    pg.restore(&cluster, &restored, None, READY_TIMEOUT)
+        .await
+        .expect("restore without the source's secrets");
+    let restored_instance = format!("{restored_name}-1");
+
+    // The data arrived.
+    assert_eq!(
+        sql(&pg, &restored_instance, "appdb", "SELECT count(*) FROM t").await,
+        "1"
+    );
+
+    // And the cluster is reachable with what pgpod stores — over TCP,
+    // which is the path `peer` auth hides. Without the rotation the
+    // generated password would belong to no role and this fails.
+    let password = sql(
+        &pg,
+        &restored_instance,
+        "postgres",
+        &format!("SELECT pg_read_file('{}')", container::SECRET_APP_OWNER),
+    )
+    .await;
+    let id: pgpod_core::InstanceId = restored_instance.parse().expect("instance id");
+    let out = pg
+        .running_container(&id)
+        .await
+        .expect("restored instance running")
+        .exec(
+            &ExecSpec::new([
+                "psql",
+                "-X",
+                "-tA",
+                "-h",
+                "127.0.0.1",
+                "-U",
+                "app",
+                "-d",
+                "appdb",
+                "-c",
+                "SELECT current_user",
+            ])
+            .env("PGPASSWORD", password.trim()),
+        )
+        .await
+        .expect("exec psql");
+    assert!(
+        out.success() && out.stdout.trim() == "app",
+        "the restored cluster is not reachable with the credentials pgpod \
+         generated for it: {}{}",
+        out.stdout.trim(),
+        out.stderr.trim()
+    );
+
+    // The superuser too — `peer` would mask a broken password here for
+    // every local caller, including pgpod's own.
+    let su = sql(
+        &pg,
+        &restored_instance,
+        "postgres",
+        &format!("SELECT pg_read_file('{}')", container::SECRET_SUPERUSER),
+    )
+    .await;
+    let out = pg
+        .running_container(&id)
+        .await
+        .expect("running")
+        .exec(
+            &ExecSpec::new([
+                "psql",
+                "-X",
+                "-tA",
+                "-h",
+                "127.0.0.1",
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-c",
+                "SELECT 1",
+            ])
+            .env("PGPASSWORD", su.trim()),
+        )
+        .await
+        .expect("exec psql");
+    assert!(
+        out.success(),
+        "the superuser password was not rotated: {}",
+        out.stderr.trim()
+    );
+
+    // And it said so, rather than rotating credentials silently.
+    let events: Vec<String> = pg
+        .registry()
+        .recent_events(&restored, 20)
+        .expect("events")
+        .into_iter()
+        .map(|e| format!("[{}] {}", e.level, e.message))
+        .collect();
+    assert!(
+        events.iter().any(|e| e.contains("rotating")),
+        "a restore that changes the database's passwords must say so: {events:?}"
+    );
+
+    let _ = pg.delete(&restored, true).await;
+    let _ = pg.delete(&cluster, true).await;
+    let _ = pg
+        .podman_client()
+        .remove_volume_destroying_data(&archive_volume)
+        .await;
 }

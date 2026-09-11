@@ -6,10 +6,12 @@
 //! it (see `adrs/00-project-setup.md` §2).
 
 mod backup;
+mod duration;
 mod ids;
 mod lifecycle;
 mod manifest;
 mod paths;
+mod pooler;
 mod secret;
 mod spec;
 
@@ -17,12 +19,15 @@ pub use backup::{
     BACKUP_SPEC_ENV, BackupJobSpec, BackupSpec, Destination, RetentionMode,
     SECRET_OBJECT_STORE_PREFIX,
 };
-pub use ids::{ClusterId, InstanceId, ParseInstanceIdError};
+pub use duration::{HumanDuration, ParseDurationError};
+pub use ids::{ClusterId, InstanceId, ParseInstanceIdError, PoolerId};
 pub use lifecycle::{InstancePhase, InstanceRole, ParsePhaseError, ParseRoleError};
 pub use manifest::{
-    API_VERSION, BootstrapSpec, ClusterManifest, ClusterSpec, KIND, ManifestError, Metadata,
-    PostgresqlSpec, StorageSpec,
+    API_VERSION, BootstrapSpec, ClusterManifest, ClusterSpec, KIND, KIND_POOLER, Manifest,
+    ManifestError, Metadata, PgDoormanSpec, PoolMode, PoolRef, PoolerClusterRef, PoolerManifest,
+    PoolerSpecManifest, PoolerType, PostgresqlSpec, StorageSpec,
 };
 pub use paths::{PathLayout, container};
+pub use pooler::{POOLER_SPEC_ENV, PoolTarget, PoolerSpec};
 pub use secret::Secret;
 pub use spec::{Bootstrap, InitdbBootstrap, InstanceSpec, RecoveryBootstrap, SPEC_ENV, SpecError};

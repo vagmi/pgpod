@@ -20,7 +20,26 @@ pub struct ClusterStatus {
     pub instances: Vec<InstanceStatus>,
     /// Advisory only — see `StorageSpec::size`.
     pub storage_size: Option<String>,
+    /// Poolers fronting this cluster.
+    ///
+    /// Reported alongside the instances rather than instead of them: a
+    /// pooler is the application endpoint, but the direct ports stay
+    /// published so that pgpod being down degrades management and not
+    /// availability (ADR 02 §6, ADR 05 §7).
+    pub poolers: Vec<PoolerStatus>,
     pub recent_events: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PoolerStatus {
+    pub pooler: String,
+    pub container: String,
+    pub host_port: u16,
+    pub running: bool,
+    /// Pools this pooler exports *for this cluster*, as clients address
+    /// them. A shared pooler's other clusters are not listed here.
+    pub pools: Vec<String>,
+    pub connection_uris: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +114,34 @@ pub(crate) async fn collect(pgpod: &Pgpod, cluster: &ClusterId) -> Result<Cluste
         });
     }
 
+    let mut poolers = Vec::new();
+    for record in pgpod.registry().poolers_for_cluster(cluster)? {
+        let running = pgpod
+            .podman()
+            .container(&record.container_name)
+            .probe()
+            .await?
+            .map(|p| p.running)
+            .unwrap_or(false);
+        let pools: Vec<String> = record
+            .pools
+            .iter()
+            .filter(|p| p.cluster == cluster.as_str())
+            .map(|p| p.pool_name.clone())
+            .collect();
+        poolers.push(PoolerStatus {
+            pooler: record.name,
+            container: record.container_name,
+            host_port: record.host_port,
+            running,
+            connection_uris: pools
+                .iter()
+                .map(|p| format!("postgresql://127.0.0.1:{}/{p}", record.host_port))
+                .collect(),
+            pools,
+        });
+    }
+
     let recent_events = pgpod
         .registry()
         .recent_events(cluster, 10)?
@@ -109,6 +156,7 @@ pub(crate) async fn collect(pgpod: &Pgpod, cluster: &ClusterId) -> Result<Cluste
         image: record.manifest.spec.image_name.clone(),
         storage_size: record.manifest.spec.storage.size.clone(),
         instances,
+        poolers,
         recent_events,
     })
 }

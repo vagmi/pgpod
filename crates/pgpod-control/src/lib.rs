@@ -6,6 +6,7 @@
 mod backup;
 mod names;
 mod password;
+mod pooler;
 mod status;
 
 use std::time::Duration;
@@ -21,8 +22,9 @@ use pgpod_runtime::{
 };
 
 pub use backup::{BackupReport, RestoreReport};
-pub use names::{LABEL_CLUSTER, LABEL_INSTANCE, SecretNames};
-pub use status::{ClusterStatus, InstanceStatus};
+pub use names::{LABEL_CLUSTER, LABEL_INSTANCE, LABEL_POOLER, SecretNames};
+pub use pooler::{PoolSummary, PoolerHold, PoolerReport};
+pub use status::{ClusterStatus, InstanceStatus, PoolerStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -78,11 +80,57 @@ pub enum Error {
     )]
     Diverged { instance: String, detail: String },
 
+    /// A pooler running an older spec.
+    ///
+    /// Its own variant rather than reusing `Diverged`: that message ends
+    /// with "`pgpod delete <cluster>` keeps the volume and the data",
+    /// which is advice about an instance. A pooler has no volume and no
+    /// data, and pointing an operator at `pgpod delete <cluster>` to fix a
+    /// pooler is pointing them at the wrong object entirely.
+    #[error(
+        "pooler {pooler} is running a different spec than the manifest \
+         describes, and the spec is fixed when the container is created.\n\n\
+         {detail}\n\n\
+         Replacing it drops every connection through it — there is nothing in \
+         front of a pooler to hold them — so pgpod will not do it \
+         implicitly:\n  pgpod pooler delete {pooler}\n  pgpod apply -f \
+         <manifest>\n\n\
+         Nothing durable is destroyed: a pooler has no volume and re-renders \
+         its config on every start."
+    )]
+    PoolerDiverged { pooler: String, detail: String },
+
     #[error("{0}")]
     Invalid(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The bootstrap superuser. `initdb` creates it and pgpod never renames it.
+const SUPERUSER_ROLE: &str = "postgres";
+
+/// What `ensure_secrets` settled, and what is left to do about it.
+struct EnsuredSecrets {
+    names: SecretNames,
+    /// `(sql role name, which secret holds its password)` for roles whose
+    /// password pgpod had to invent because the source's secret was not on
+    /// this host. Empty in every case but that one.
+    rotate: Vec<(String, String)>,
+}
+
+/// Which role a secret name belongs to, for a message an operator reads.
+///
+/// The podman secret name is `pgpod-<cluster>-<role>`, and quoting the
+/// whole thing back at someone tells them about pgpod's naming rather
+/// than about which password they need to reset.
+fn role_of<'a>(secret: &'a str, cluster: &ClusterId) -> &'a str {
+    // Strip the whole `pgpod-<cluster>-` prefix rather than splitting on
+    // the last '-': the app owner's secret ends `-app-owner`, and taking
+    // the final segment would report it as "owner".
+    secret
+        .strip_prefix(&format!("pgpod-{cluster}-"))
+        .unwrap_or(secret)
+}
 
 /// The pgpod control plane.
 pub struct Pgpod {
@@ -97,12 +145,42 @@ pub struct Pgpod {
 /// are computed once per apply and are the same for every instance, so
 /// passing them individually invites a caller passing one instance's value
 /// while creating another.
-struct ApplyContext<'a> {
+pub(crate) struct ApplyContext<'a> {
     bootstrap: Bootstrap,
     /// The cluster's podman subnet, for `pg_hba.conf`.
     network_cidr: Option<String>,
     secrets: SecretNames,
     agent: &'a std::path::Path,
+    /// Whether a diverged instance may be recreated in place.
+    recreate: bool,
+}
+
+/// How one `apply` should behave.
+///
+/// A struct rather than more boolean parameters: `apply(m, wait, false)`
+/// at a call site says nothing about what the `false` refuses to do, and
+/// the thing it refuses to do here is an outage.
+#[derive(Debug, Clone, Copy)]
+pub struct ApplyOptions {
+    /// How long to wait for instances to accept connections.
+    pub wait: Duration,
+    /// Recreate an instance whose running spec differs from the manifest.
+    ///
+    /// Off by default, because the spec travels in an environment variable
+    /// fixed at container-create time, so applying a changed manifest
+    /// means *replacing* the container. With a pooler in front that is a
+    /// held pause rather than an outage; without one it drops every
+    /// connection, which is why it is never implicit.
+    pub recreate: bool,
+}
+
+impl Default for ApplyOptions {
+    fn default() -> Self {
+        Self {
+            wait: Duration::from_secs(180),
+            recreate: false,
+        }
+    }
 }
 
 /// What `apply` did.
@@ -133,6 +211,9 @@ pub struct DeleteReport {
     pub volumes_removed: Vec<String>,
     /// Kept volumes, so the operator can see their data is still there.
     pub volumes_retained: Vec<String>,
+    /// Poolers still fronting this cluster, which are now pointed at an
+    /// instance that is not running.
+    pub poolers: Vec<String>,
 }
 
 impl Pgpod {
@@ -160,10 +241,26 @@ impl Pgpod {
 
     /// Create or converge a cluster.
     pub async fn apply(&self, manifest: &ClusterManifest, wait: Duration) -> Result<ApplyReport> {
+        self.apply_with(
+            manifest,
+            ApplyOptions {
+                wait,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Create or converge a cluster, choosing what divergence may do.
+    pub async fn apply_with(
+        &self,
+        manifest: &ClusterManifest,
+        options: ApplyOptions,
+    ) -> Result<ApplyReport> {
         self.apply_with_bootstrap(
             manifest,
             Bootstrap::Initdb(manifest.spec.bootstrap.initdb.clone()),
-            wait,
+            options,
         )
         .await
     }
@@ -178,8 +275,9 @@ impl Pgpod {
         &self,
         manifest: &ClusterManifest,
         bootstrap: Bootstrap,
-        wait: Duration,
+        options: ApplyOptions,
     ) -> Result<ApplyReport> {
+        let wait = options.wait;
         let cluster = manifest.cluster_id()?;
         self.validate_parameters(manifest)?;
 
@@ -208,11 +306,16 @@ impl Pgpod {
                 .await?;
         }
 
+        let EnsuredSecrets {
+            names: secrets,
+            rotate,
+        } = self.ensure_secrets(&cluster, manifest, &bootstrap).await?;
         let ctx = ApplyContext {
             bootstrap,
             network_cidr: network.subnet.clone(),
-            secrets: self.ensure_secrets(&cluster, manifest).await?,
+            secrets,
             agent: &agent,
+            recreate: options.recreate,
         };
 
         let mut summaries = Vec::new();
@@ -226,6 +329,22 @@ impl Pgpod {
             for ordinal in 1..=manifest.spec.instances {
                 self.wait_ready(&cluster.instance(ordinal), wait).await?;
             }
+            // After readiness, because ALTER ROLE needs a writable
+            // cluster: a restore is still replaying, and then promoting,
+            // right up until it is ready.
+            self.rotate_restored_roles(&cluster, &rotate).await?;
+        } else if !rotate.is_empty() {
+            // Nothing has waited for the cluster to become writable, so
+            // there is no moment at which the rotation could have run.
+            // Said out loud rather than skipped quietly.
+            self.registry.record_event(
+                cluster.as_str(),
+                None,
+                "warn",
+                "credentials were not rotated because apply did not wait for \
+                 readiness — re-apply with a non-zero wait to make this \
+                 cluster reachable",
+            )?;
         }
 
         self.registry.set_cluster_phase(&cluster, "running")?;
@@ -296,10 +415,26 @@ impl Pgpod {
         let handle = self.podman.container(instance.container_name());
         let probe = handle.probe().await?;
         let container_id = match probe {
-            Some(p) if p.running => {
-                Self::refuse_if_diverged(manifest, instance, ctx, &p)?;
-                p.id
-            }
+            Some(p) if p.running => match Self::refuse_if_diverged(manifest, instance, ctx, &p) {
+                // Nothing changed. Recreating a healthy instance that
+                // already matches the manifest would be a pointless
+                // outage, so `--recreate` is permission, not instruction.
+                Ok(()) => p.id,
+                Err(e) if ctx.recreate => {
+                    // Journalled before the container is touched: what
+                    // changed is the operator's evidence that the outage
+                    // was the one they asked for.
+                    self.registry.record_event(
+                        cluster.as_str(),
+                        Some(instance.ordinal()),
+                        "info",
+                        &format!("spec diverged, recreating: {e}"),
+                    )?;
+                    self.recreate_instance(manifest, instance, ctx, host_port)
+                        .await?
+                }
+                Err(e) => return Err(e),
+            },
             Some(p) => {
                 Self::refuse_if_diverged(manifest, instance, ctx, &p)?;
                 self.podman.container(&p.id).start().await?;
@@ -568,20 +703,239 @@ impl Pgpod {
         &self,
         cluster: &ClusterId,
         manifest: &ClusterManifest,
-    ) -> Result<SecretNames> {
+        bootstrap: &Bootstrap,
+    ) -> Result<EnsuredSecrets> {
         let names = SecretNames::for_cluster(cluster);
         let wants_app = manifest.spec.bootstrap.initdb.database.is_some();
 
-        for name in names.all() {
+        // A restored cluster does not get fresh credentials, because it
+        // does not get fresh roles. `pg_authid` comes out of the backup
+        // carrying the source's, and the restore path deliberately does
+        // not rewrite them — that is the whole point of restoring a
+        // database "as it was". Generating passwords here produced secrets
+        // no role has: `pgpod status` printed a `postgresql://app@…` URI
+        // that could not be used, and nothing said why, because
+        // `pgpod psql` goes over the unix socket with `peer` and never
+        // touched them (ADR 04 §8).
+        let source = match bootstrap {
+            Bootstrap::Recovery(r) => Some(
+                ClusterId::new(r.source_stanza.clone())
+                    .map_err(|e| Error::Invalid(format!("recovery source: {e}")))?,
+            ),
+            Bootstrap::Initdb(_) => None,
+        };
+        let source_names = source.as_ref().map(SecretNames::for_cluster);
+
+        let mut unavailable = Vec::new();
+        for (name, from) in match &source_names {
+            Some(s) => names.paired(s),
+            // Paired with itself when there is no source: the loop below
+            // never consults `from` unless `source_names` is `Some`.
+            None => names.paired(&names),
+        } {
             if name == names.app_owner && !wants_app {
                 continue;
             }
-            if !self.podman.secret_exists(name).await? {
-                let generated: Secret = password::generate();
-                self.podman.put_secret(name, generated.expose()).await?;
+            if self.podman.secret_exists(name).await? {
+                continue;
+            }
+
+            let adopted = match &source_names {
+                Some(_) => self.podman.secret_value(from).await?,
+                None => None,
+            };
+            match adopted {
+                Some(value) => {
+                    self.podman.put_secret(name, &value).await?;
+                }
+                None => {
+                    if source_names.is_some() {
+                        // The source's secret is not on this host — a
+                        // restore onto a fresh machine, which is a
+                        // supported and deliberate path (ADR 04 §5). The
+                        // password in the restored database came from the
+                        // backup and nobody here knows it, so the role is
+                        // rotated to this generated one once the cluster
+                        // is writable. Recorded by role name, not by
+                        // secret name: it is the thing that gets altered.
+                        unavailable.push(role_of(name, cluster).to_string());
+                    }
+                    let generated: Secret = password::generate();
+                    self.podman.put_secret(name, generated.expose()).await?;
+                }
             }
         }
-        Ok(names)
+
+        let rotate = if unavailable.is_empty() {
+            Vec::new()
+        } else {
+            let from = source
+                .as_ref()
+                .map(ClusterId::to_string)
+                .unwrap_or_default();
+            self.registry.record_event(
+                cluster.as_str(),
+                None,
+                "warn",
+                &format!(
+                    "restored from {from}, whose secrets are not on this host — \
+                     rotating {} to freshly generated passwords so the cluster \
+                     is reachable",
+                    unavailable.join(", ")
+                ),
+            )?;
+            // Translate each secret's role into the SQL role to alter.
+            // The app owner's name comes from the manifest; the rest are
+            // fixed by pgpod.
+            unavailable
+                .iter()
+                .filter_map(|which| {
+                    let role = match which.as_str() {
+                        "superuser" => Some(SUPERUSER_ROLE.to_string()),
+                        "replication" => Some(pgpod_pg::REPLICATION_ROLE.to_string()),
+                        "monitor" => Some(pgpod_pg::MONITOR_ROLE.to_string()),
+                        "app-owner" => manifest.spec.bootstrap.initdb.owner.clone(),
+                        _ => None,
+                    }?;
+                    Some((role, which.clone()))
+                })
+                .collect()
+        };
+
+        Ok(EnsuredSecrets { names, rotate })
+    }
+
+    /// Rotate roles whose password came out of a backup nobody here holds.
+    ///
+    /// Runs once the instance is accepting connections, over the unix
+    /// socket as the container's own user — `peer`, so it needs no
+    /// password, which is the only reason this is possible at all.
+    ///
+    /// A failure fails the restore. A cluster whose data is correct and
+    /// whose credentials are unknown is not a successful restore, and
+    /// reporting it as one is how an operator finds out during the next
+    /// incident instead of this one.
+    async fn rotate_restored_roles(
+        &self,
+        cluster: &ClusterId,
+        rotate: &[(String, String)],
+    ) -> Result<()> {
+        if rotate.is_empty() {
+            return Ok(());
+        }
+        let names = SecretNames::for_cluster(cluster);
+        let instance = cluster.instance(1);
+        let container = self.running_container(&instance).await?;
+
+        // **Readiness is not writability.** `wait_ready` polls
+        // `pg_isready`, which succeeds as soon as the postmaster accepts
+        // connections — and a restoring cluster accepts them while it is
+        // still replaying, promoting only once it reaches its target. Left
+        // out, the rotation raced the promotion and lost:
+        // `ERROR: cannot execute ALTER ROLE in a read-only transaction`.
+        // It passed locally against a small archive and failed on the
+        // deployment target against a real one, which is the way this
+        // class of bug usually arrives.
+        self.wait_writable(&instance, Duration::from_secs(300))
+            .await?;
+
+        for (role, which) in rotate {
+            let secret = match which.as_str() {
+                "superuser" => &names.superuser,
+                "replication" => &names.replication,
+                "monitor" => &names.monitor,
+                _ => &names.app_owner,
+            };
+            let password = self
+                .podman
+                .secret_value(secret)
+                .await?
+                .map(Secret::new)
+                .ok_or_else(|| {
+                    Error::Invalid(format!("secret {secret} vanished between create and use"))
+                })?;
+
+            let sql = pgpod_pg::alter_role_password_sql(role, &password)?;
+            let out = container
+                .exec(&ExecSpec::new([
+                    "psql",
+                    "-X",
+                    "-q",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-h",
+                    container::SOCKET_DIR,
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "postgres",
+                    "-c",
+                    &sql,
+                ]))
+                .await?;
+            if !out.success() {
+                // The statement carries the new password; report only what
+                // postgres said.
+                return Err(Error::Invalid(format!(
+                    "could not rotate the {role:?} password on restored cluster \
+                     {cluster}, so it would not be reachable with the \
+                     credentials pgpod stores: {}",
+                    out.stderr.trim()
+                )));
+            }
+            self.registry.record_event(
+                cluster.as_str(),
+                Some(1),
+                "info",
+                &format!("rotated the {role} password after restore"),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Wait until the instance is out of recovery and accepting writes.
+    ///
+    /// Distinct from [`Self::wait_ready`], and deliberately not folded
+    /// into it: a standby is read-only for its whole life, so "accepting
+    /// connections" is the right readiness test in general. This is for
+    /// the one path that must then write — a restore, which promotes at
+    /// its recovery target.
+    async fn wait_writable(&self, instance: &InstanceId, timeout: Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        let container = self.podman.container(instance.container_name());
+        let mut last = String::new();
+
+        while std::time::Instant::now() < deadline {
+            let probe = ExecSpec::new([
+                "psql",
+                "-X",
+                "-tA",
+                "-h",
+                container::SOCKET_DIR,
+                "-U",
+                "postgres",
+                "-c",
+                "SELECT pg_is_in_recovery()",
+            ]);
+            match container.exec(&probe).await {
+                Ok(out) if out.success() && out.stdout.trim() == "f" => return Ok(()),
+                Ok(out) if out.success() => last = "still in recovery".to_string(),
+                Ok(out) => last = format!("{}{}", out.stdout.trim(), out.stderr.trim()),
+                Err(e) => last = e.to_string(),
+            }
+            if let Some(p) = container.probe().await?
+                && !p.running
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        Err(Error::NotReady {
+            instance: instance.to_string(),
+            seconds: timeout.as_secs(),
+            detail: format!("never left recovery: {last}"),
+        })
     }
 
     async fn wait_ready(&self, instance: &InstanceId, timeout: Duration) -> Result<()> {
@@ -682,6 +1036,36 @@ impl Pgpod {
         let record = self.registry.require_cluster(cluster)?;
         let instances = self.registry.instances(cluster)?;
 
+        // **Checked before anything is removed.** The registry refuses to
+        // drop a cluster row a pooler still references, but that check
+        // sits at the *end* of this function — so a `--purge` would remove
+        // the containers, destroy the volumes, and only then report that
+        // it had refused. Found by a test that deleted a fronted cluster
+        // and then could not delete it again, because there was nothing
+        // left to delete.
+        //
+        // Only `--purge` is refused. A plain delete keeps the volumes and
+        // a later apply brings the instance back under the same name,
+        // which the pooler picks up on its own — `server_host` is
+        // re-resolved per backend connect. Destroying the data underneath
+        // a live pooler is the one that cannot be undone.
+        let poolers: Vec<String> = self
+            .registry
+            .poolers_for_cluster(cluster)?
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        if purge && !poolers.is_empty() {
+            return Err(Error::Invalid(format!(
+                "cluster {cluster} is still fronted by pooler {}, and --purge \
+                 destroys its data. Delete the pooler first \
+                 (`pgpod pooler delete {}`), or drop --purge to keep the \
+                 volumes.",
+                poolers.join(", "),
+                poolers[0],
+            )));
+        }
+
         let mut containers_removed = Vec::new();
         let mut volumes_removed = Vec::new();
         let mut volumes_retained = Vec::new();
@@ -710,8 +1094,11 @@ impl Pgpod {
             }
         }
 
-        // The network holds no data and podman refuses to remove one that
-        // still has containers attached, so this is safe either way.
+        // The network holds no data, and `remove_network` is the
+        // non-forcing call, so podman refuses while anything is still
+        // attached — a pooler fronting this cluster, most likely. Ignoring
+        // the error is the whole intent: the network outliving a delete is
+        // correct when something is still using it.
         let _ = self.podman.remove_network(&cluster.network_name()).await;
 
         if purge {
@@ -741,6 +1128,7 @@ impl Pgpod {
             containers_removed,
             volumes_removed,
             volumes_retained,
+            poolers,
         })
     }
 }
@@ -881,6 +1269,24 @@ fn allocate_port() -> Result<u16> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_secret_name_reduces_to_the_role_an_operator_must_reset() {
+        // The message names the password to fix, not pgpod's naming
+        // scheme. "pgpod-mydb-restored-app-owner" is not an answer to
+        // "which password is wrong".
+        let mydb = ClusterId::new("mydb").unwrap();
+        assert_eq!(role_of("pgpod-mydb-superuser", &mydb), "superuser");
+        assert_eq!(
+            role_of("pgpod-mydb-app-owner", &mydb),
+            "app-owner",
+            "splitting on the last '-' would report this as \"owner\""
+        );
+        // A hyphenated cluster name must not confuse the prefix either.
+        let hyphen = ClusterId::new("my-db").unwrap();
+        assert_eq!(role_of("pgpod-my-db-monitor", &hyphen), "monitor");
+        assert_eq!(role_of("unexpected", &mydb), "unexpected");
+    }
+
     use super::*;
 
     fn manifest(yaml: &str) -> ClusterManifest {

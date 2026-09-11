@@ -236,7 +236,13 @@ impl Pgpod {
             .apply_with_bootstrap(
                 &target_manifest,
                 pgpod_core::Bootstrap::Recovery(recovery),
-                wait,
+                // A restore creates a cluster that does not exist yet, so
+                // there is nothing to recreate and no pooler in front of
+                // it to hold.
+                crate::ApplyOptions {
+                    wait,
+                    recreate: false,
+                },
             )
             .await?;
 

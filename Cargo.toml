@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/pgpod-core",
     "crates/pgpod-backup",
+    "crates/pgpod-pooler",
     "crates/pgpod-runtime",
     "crates/pgpod-pg",
     "crates/pgpod-registry",
@@ -23,6 +24,7 @@ repository = "https://github.com/vagmi/pgpod"
 # In-workspace crates
 pgpod-core = { path = "crates/pgpod-core" }
 pgpod-backup = { path = "crates/pgpod-backup" }
+pgpod-pooler = { path = "crates/pgpod-pooler" }
 pgpod-runtime = { path = "crates/pgpod-runtime" }
 pgpod-pg = { path = "crates/pgpod-pg" }
 pgpod-registry = { path = "crates/pgpod-registry" }
@@ -57,6 +59,9 @@ bytes = "1"
 # static agent build (ROADMAP Phase 2, "Derisked").
 zstd = "0.13"
 sha2 = "0.10"
+# pg_doorman's admin console authenticates with MD5 and nothing else
+# (ADR 05 §5), so the agent needs it to speak to its own pooler.
+md-5 = "0.10"
 hex = "0.4"
 serde_yaml = "0.9"
 rand = "0.9"

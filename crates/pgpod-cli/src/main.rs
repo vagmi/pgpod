@@ -36,16 +36,30 @@ enum Command {
     /// Check that this host can run pgpod. Run this first.
     Doctor,
 
-    /// Create or converge a cluster from a manifest.
+    /// Create or converge a cluster or pooler from a manifest.
     Apply {
-        /// Path to the cluster manifest.
+        /// Path to the manifest. Its `kind` selects what is applied.
         #[arg(short = 'f', long = "file")]
         file: String,
         /// Seconds to wait for the instance to accept connections.
         /// `0` returns as soon as the container is started.
         #[arg(long, default_value_t = 180)]
         wait: u64,
+        /// Replace an instance whose running spec differs from the
+        /// manifest.
+        ///
+        /// The instance spec is fixed when the container is created, so
+        /// applying a changed manifest means replacing the container.
+        /// With a pooler in front, clients are held at the pooler and
+        /// released afterwards; without one, every open connection drops.
+        /// Never implicit, for that reason.
+        #[arg(long)]
+        recreate: bool,
     },
+
+    /// Inspect and control connection poolers.
+    #[command(subcommand)]
+    Pooler(PoolerCommand),
 
     /// Show cluster state. Omit the name to list every cluster.
     Status { cluster: Option<String> },
@@ -134,6 +148,23 @@ enum VolumeCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum PoolerCommand {
+    /// List poolers and the pools they export.
+    List,
+    /// Show live pool utilisation, straight from pg_doorman.
+    Pools { pooler: String },
+    /// Hold one cluster's pools.
+    ///
+    /// The hold is released automatically when the pooler's `maxHold`
+    /// budget expires, so a forgotten pause cannot wedge a cluster.
+    Pause { pooler: String, cluster: String },
+    /// Release one cluster's pools.
+    Resume { pooler: String, cluster: String },
+    /// Remove a pooler. Destroys nothing durable.
+    Delete { pooler: String },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -156,7 +187,24 @@ async fn main() -> Result<()> {
             // with a clean report, not an error dumped over the top of it.
             std::process::exit(report.exit_code());
         }
-        Command::Apply { file, wait } => emit(commands::apply(&file, wait).await?, format),
+        Command::Apply {
+            file,
+            wait,
+            recreate,
+        } => emit(commands::apply(&file, wait, recreate).await?, format),
+        Command::Pooler(PoolerCommand::List) => emit(commands::pooler_list().await?, format),
+        Command::Pooler(PoolerCommand::Pools { pooler }) => {
+            emit(commands::pooler_pools(&pooler).await?, format)
+        }
+        Command::Pooler(PoolerCommand::Pause { pooler, cluster }) => {
+            emit(commands::pooler_pause(&pooler, &cluster).await?, format)
+        }
+        Command::Pooler(PoolerCommand::Resume { pooler, cluster }) => {
+            emit(commands::pooler_resume(&pooler, &cluster).await?, format)
+        }
+        Command::Pooler(PoolerCommand::Delete { pooler }) => {
+            emit(commands::pooler_delete(&pooler).await?, format)
+        }
         Command::Status { cluster } => emit(commands::status(cluster).await?, format),
         Command::Backup { cluster, wait } => {
             emit(commands::backup(&cluster, wait).await?, format)

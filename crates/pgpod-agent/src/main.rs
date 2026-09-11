@@ -9,6 +9,10 @@
 //!
 //! 1. **Container entrypoint** (`instance run`) — bootstraps PGDATA,
 //!    renders config, then supervises `postgres` and serves `/status`.
+//! 2. **Pooler entrypoint** (`pooler run`) — renders pg_doorman's config,
+//!    supervises it, and serves a control socket. Same division of labour,
+//!    different container (ADR 05 §5). The remaining `pooler` subcommands
+//!    are clients of that socket, run by the daemon through `podman exec`.
 //!
 //! It no longer ships WAL or takes base backups. PostgreSQL invokes
 //! pgBackRest directly as `archive_command` and `restore_command`, and
@@ -18,6 +22,7 @@
 mod bootstrap;
 mod log;
 mod pgbackrest;
+mod pooler;
 mod psql;
 mod recovery;
 mod secrets;
@@ -42,6 +47,35 @@ enum Command {
     /// Instance lifecycle. Run as the container entrypoint.
     #[command(subcommand)]
     Instance(InstanceCommand),
+
+    /// Pooler lifecycle and control.
+    #[command(subcommand)]
+    Pooler(PoolerCommand),
+}
+
+#[derive(Subcommand)]
+enum PoolerCommand {
+    /// Render the config, then supervise pg_doorman. This is PID 1.
+    Run,
+    /// Hold one cluster's pools.
+    ///
+    /// Always deadlined: PID 1 releases the hold when the budget expires
+    /// whether or not anyone asks it to, so a caller that dies mid-window
+    /// cannot leave clients held (ADR 05, consequences).
+    Pause {
+        cluster: String,
+        /// Override the spec's `maxHold` for this hold. Needs a unit.
+        #[arg(long, value_name = "DURATION")]
+        hold: Option<String>,
+    },
+    /// Release one cluster's pools.
+    Resume { cluster: String },
+    /// Recycle backend connections for one cluster's pools.
+    Reconnect { cluster: String },
+    /// Print `SHOW POOLS` as JSON.
+    Pools,
+    /// Ask pg_doorman to re-read its config.
+    Reload,
 }
 
 #[derive(Subcommand)]
@@ -62,7 +96,43 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&status::probe())?);
             Ok(())
         }
+        Command::Pooler(PoolerCommand::Run) => pooler::run().await,
+        Command::Pooler(other) => control(other).await,
     }
+}
+
+/// Send one control request to the pooler agent and print its reply.
+///
+/// Exits non-zero when the pooler reports an error, so `podman exec`
+/// carries the failure back to the daemon rather than making it parse
+/// stdout to find out whether a hold was actually taken.
+async fn control(command: PoolerCommand) -> Result<()> {
+    let request = match command {
+        PoolerCommand::Run => unreachable!("handled above"),
+        PoolerCommand::Pause { cluster, hold } => {
+            let hold = match hold {
+                Some(raw) => Some(
+                    raw.parse::<pgpod_core::HumanDuration>()
+                        .map_err(|e| anyhow::anyhow!("--hold: {e}"))?,
+                ),
+                None => None,
+            };
+            pooler::Request::Pause { cluster, hold }
+        }
+        PoolerCommand::Resume { cluster } => pooler::Request::Resume { cluster },
+        PoolerCommand::Reconnect { cluster } => pooler::Request::Reconnect { cluster },
+        PoolerCommand::Pools => pooler::Request::Pools,
+        PoolerCommand::Reload => pooler::Request::Reload,
+    };
+
+    let response = pooler::send(&request).await?;
+    println!("{}", serde_json::to_string(&response)?);
+    if let pooler::Response::Error { message } = response {
+        // The message is already on stdout as JSON; this is the exit code
+        // the caller actually branches on.
+        anyhow::bail!("{message}");
+    }
+    Ok(())
 }
 
 async fn run() -> Result<()> {
@@ -122,10 +192,7 @@ async fn run() -> Result<()> {
         let stanza = spec.instance.cluster().as_str().to_string();
         tokio::spawn(async move {
             if supervise::wait_until_ready(Duration::from_secs(120)).await {
-                let _ = pgbackrest::ensure_stanza(
-                    &stanza,
-                    pgpod_core::container::PG_PORT,
-                );
+                let _ = pgbackrest::ensure_stanza(&stanza, pgpod_core::container::PG_PORT);
             } else {
                 warn!(
                     "postgres did not become ready in time, so the pgbackrest \

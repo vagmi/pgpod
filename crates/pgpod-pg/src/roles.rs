@@ -16,6 +16,59 @@ pub const REPLICATION_ROLE: &str = "streaming_replica";
 /// statistics views without granting data access.
 pub const MONITOR_ROLE: &str = "pgpod_monitor";
 
+/// Role a pooler runs its `auth_query` lookup as (ADR 05 §4).
+///
+/// It has `LOGIN` and nothing else. Reading `pg_shadow` requires
+/// superuser, so the access it needs comes from a `SECURITY DEFINER`
+/// function granted to it alone — never from role attributes, and never
+/// from `pg_monitor`, which does not grant it anyway.
+pub const POOLER_ROLE: &str = "pgpod_pooler";
+
+/// The lookup function's name, derived from the role so the SQL that
+/// creates it and the config that calls it cannot drift.
+pub fn pooler_lookup_function() -> String {
+    format!("{POOLER_ROLE}_lookup")
+}
+
+/// SQL creating the pooler's lookup role and function.
+///
+/// Separate from [`BootstrapRoles::statements`] and idempotent, because it
+/// has two callers that cannot be merged: bootstrap, where it runs with
+/// every other role, and `pgpod apply -f pooler.yaml` against a cluster
+/// created before poolers existed, where it runs on its own years later.
+/// One set of statements, so the two paths cannot diverge.
+///
+/// The function is `SECURITY DEFINER` and owned by the bootstrap
+/// superuser, with `search_path` pinned to `pg_catalog, pg_temp` — without
+/// that, anything able to create a schema could shadow `pg_shadow` and
+/// have the definer read its table instead.
+pub fn pooler_lookup_sql(password: &Secret) -> Result<Vec<String>, Error> {
+    validate_identifier(POOLER_ROLE)?;
+    let function = pooler_lookup_function();
+    Ok(vec![
+        create_role_if_absent(POOLER_ROLE, "LOGIN", password),
+        format!(
+            "CREATE OR REPLACE FUNCTION {fn_ident}(uname text) \
+             RETURNS TABLE(passwd text) LANGUAGE sql SECURITY DEFINER \
+             SET search_path = pg_catalog, pg_temp \
+             AS $pgpod$ SELECT passwd FROM pg_shadow WHERE usename = uname; $pgpod$;",
+            fn_ident = quote_ident(&function)
+        ),
+        // Revoked from PUBLIC first: a SECURITY DEFINER function over
+        // pg_shadow that anyone may execute hands every role's verifier to
+        // every role.
+        format!(
+            "REVOKE ALL ON FUNCTION {fn_ident}(text) FROM PUBLIC;",
+            fn_ident = quote_ident(&function)
+        ),
+        format!(
+            "GRANT EXECUTE ON FUNCTION {fn_ident}(text) TO {role};",
+            fn_ident = quote_ident(&function),
+            role = quote_ident(POOLER_ROLE)
+        ),
+    ])
+}
+
 #[derive(Debug, Clone)]
 pub struct BootstrapRoles {
     pub superuser: String,
@@ -110,6 +163,26 @@ impl BootstrapRoles {
             ),
         )))
     }
+}
+
+/// `ALTER ROLE <name> WITH PASSWORD <secret>`.
+///
+/// For the one case where pgpod has to change a password in a database it
+/// did not create: a cluster restored onto a host that does not hold the
+/// source's secrets. Its roles came out of the backup with passwords
+/// nobody here knows, so the choice is to rotate them to something pgpod
+/// *does* know or to hand back a cluster nobody can connect to
+/// (ADR 04 §8).
+///
+/// Validated and quoted like everything else here, because the role name
+/// can reach this from a manifest.
+pub fn alter_role_password_sql(role: &str, password: &Secret) -> Result<String, Error> {
+    validate_identifier(role)?;
+    Ok(format!(
+        "ALTER ROLE {} WITH PASSWORD {};",
+        quote_ident(role),
+        quote_literal(password.expose())
+    ))
 }
 
 fn create_role_if_absent(name: &str, attrs: &str, password: &Secret) -> String {
@@ -328,5 +401,118 @@ mod tests {
     fn quoting_helpers_double_the_right_character() {
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
         assert_eq!(quote_literal("a'b"), "'a''b'");
+    }
+
+    // ---- the pooler lookup role --------------------------------------
+
+    #[test]
+    fn the_pooler_role_gets_login_and_nothing_else() {
+        // Reading pg_shadow needs superuser; the access comes from the
+        // SECURITY DEFINER function, never from role attributes. A role
+        // with SUPERUSER here would hand a compromised pooler the cluster.
+        let sql = pooler_lookup_sql(&Secret::new("pw")).unwrap().join("\n");
+        assert!(sql.contains("CREATE ROLE \"pgpod_pooler\" LOGIN"), "{sql}");
+        for forbidden in [
+            "SUPERUSER",
+            "CREATEDB",
+            "CREATEROLE",
+            "REPLICATION",
+            "BYPASSRLS",
+        ] {
+            assert!(
+                !sql.contains(forbidden),
+                "the pooler lookup role must not have {forbidden}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_lookup_function_is_locked_down() {
+        let sql = pooler_lookup_sql(&Secret::new("pw")).unwrap().join("\n");
+        assert!(sql.contains("SECURITY DEFINER"), "{sql}");
+        assert!(
+            sql.contains("SET search_path = pg_catalog, pg_temp"),
+            "without a pinned search_path, anything able to create a schema \
+             could shadow pg_shadow and have the definer read its table: {sql}"
+        );
+        // Order matters: the revoke has to precede the grant, or PUBLIC
+        // keeps EXECUTE on a function that reads every role's verifier.
+        let revoke = sql.find("REVOKE ALL ON FUNCTION").expect("a revoke");
+        let grant = sql.find("GRANT EXECUTE ON FUNCTION").expect("a grant");
+        assert!(revoke < grant, "REVOKE from PUBLIC must come first: {sql}");
+        assert!(sql.contains("FROM PUBLIC"), "{sql}");
+    }
+
+    #[test]
+    fn the_function_name_matches_what_the_pooler_config_calls() {
+        // The config renders `SELECT passwd FROM <role>_lookup($1)`. If
+        // these two ever disagree, every client authentication fails with
+        // a message about a missing function.
+        let function = pooler_lookup_function();
+        assert_eq!(function, "pgpod_pooler_lookup");
+        let sql = pooler_lookup_sql(&Secret::new("pw")).unwrap().join("\n");
+        assert!(
+            sql.contains(&format!("FUNCTION \"{function}\"(uname text)")),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn the_lookup_sql_is_idempotent() {
+        // It runs at bootstrap and again, years later, when a pooler is
+        // applied to a cluster that predates poolers. Both paths run these
+        // same statements, so neither may fail on a second run.
+        let sql = pooler_lookup_sql(&Secret::new("pw")).unwrap().join("\n");
+        assert!(sql.contains("IF NOT EXISTS"), "role creation: {sql}");
+        assert!(
+            sql.contains("CREATE OR REPLACE FUNCTION"),
+            "function: {sql}"
+        );
+    }
+
+    #[test]
+    fn the_lookup_password_is_quoted_like_every_other() {
+        let sql = pooler_lookup_sql(&Secret::new("pw'; DROP ROLE postgres; --"))
+            .unwrap()
+            .join("\n");
+        assert!(sql.contains("'pw''; DROP ROLE postgres; --'"), "{sql}");
+        assert!(!sql.contains("DROP ROLE postgres;\n"), "{sql}");
+    }
+
+    #[test]
+    fn the_lookup_role_is_not_created_by_the_ordinary_bootstrap_statements() {
+        // It has its own statements because it has a second caller. This
+        // pins that they stay separate, so adding it to `statements()`
+        // later is a deliberate change rather than an accident.
+        let sql = roles().statements().unwrap().join("\n");
+        assert!(!sql.contains(POOLER_ROLE), "{sql}");
+    }
+
+    #[test]
+    fn rotating_a_password_quotes_both_halves() {
+        let sql = alter_role_password_sql("app", &Secret::new("p'w")).unwrap();
+        assert_eq!(sql, "ALTER ROLE \"app\" WITH PASSWORD 'p''w';");
+    }
+
+    #[test]
+    fn rotation_validates_the_role_name() {
+        // The app owner's name comes from a manifest, so quoting is the
+        // second line of defence rather than the only one.
+        for bad in ["app; DROP DATABASE appdb", "\"app\"", "", "App"] {
+            assert!(
+                alter_role_password_sql(bad, &Secret::new("x")).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_does_not_grant_anything() {
+        // It changes a password and nothing else: a restored cluster's
+        // role memberships are part of the data being restored.
+        let sql = alter_role_password_sql("app", &Secret::new("x")).unwrap();
+        for forbidden in ["GRANT", "SUPERUSER", "LOGIN", "CREATE"] {
+            assert!(!sql.contains(forbidden), "{sql}");
+        }
     }
 }

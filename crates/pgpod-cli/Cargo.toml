@@ -16,6 +16,7 @@ pgpod-core.workspace = true
 pgpod-runtime.workspace = true
 pgpod-control.workspace = true
 pgpod-backup.workspace = true
+pgpod-pooler.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 clap.workspace = true

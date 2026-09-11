@@ -748,8 +748,14 @@ mod tests {
                 vec![("s3-key".into(), "KEY-TWO".into())],
             ])
             .render();
-        assert_eq!(setting(&rendered, "repo1-s3-key").as_deref(), Some("KEY-ONE"));
-        assert_eq!(setting(&rendered, "repo2-s3-key").as_deref(), Some("KEY-TWO"));
+        assert_eq!(
+            setting(&rendered, "repo1-s3-key").as_deref(),
+            Some("KEY-ONE")
+        );
+        assert_eq!(
+            setting(&rendered, "repo2-s3-key").as_deref(),
+            Some("KEY-TWO")
+        );
     }
 
     #[test]
@@ -759,7 +765,10 @@ mod tests {
         let rendered = config(&["gs://b/p", "s3://c/p"])
             .with_credentials(vec![vec![]])
             .render();
-        assert_eq!(setting(&rendered, "repo1-gcs-key-type").as_deref(), Some("auto"));
+        assert_eq!(
+            setting(&rendered, "repo1-gcs-key-type").as_deref(),
+            Some("auto")
+        );
         assert_eq!(setting(&rendered, "repo2-s3-key"), None);
     }
 

@@ -66,6 +66,50 @@ impl PodmanClient {
         })
     }
 
+    /// Read a secret's value back, or `None` if there is no such secret.
+    ///
+    /// **This is not a privilege boundary being crossed.** pgpod's secrets
+    /// live in `~/.local/share/containers/storage/secrets/`, base64 in a
+    /// file owned by the user the daemon already runs as — it could always
+    /// read them, and going through libpod is simply the supported way to
+    /// ask. What the absence of this function bought until now was a
+    /// discipline: code that cannot read a credential cannot accidentally
+    /// log, copy, or compare one.
+    ///
+    /// It exists for one caller. A restored cluster's `pg_authid` comes
+    /// out of the backup carrying the **source's** roles, so generating
+    /// fresh passwords for it produces secrets no role has (ADR 04 §8).
+    /// Adopting the source's credentials means reading them.
+    ///
+    /// `podman-api` cannot do this: its `Secret::inspect` omits
+    /// `?showsecret=true`, so the response has no `SecretData`.
+    pub async fn secret_value(&self, name: &str) -> Result<Option<String>> {
+        let (status, body) = crate::http::get(
+            self.socket_path(),
+            &format!("/v4.0.0/libpod/secrets/{name}/json?showsecret=true"),
+        )
+        .await?;
+
+        if status == 404 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&status) {
+            // Deliberately does not echo the body: on some paths podman
+            // repeats request context, and this response contains a
+            // secret.
+            return Err(Error::Secret(format!(
+                "failed to read secret {name}: HTTP {status}"
+            )));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|_| Error::Secret(format!("read secret {name}: unreadable response")))?;
+        Ok(parsed
+            .get("SecretData")
+            .and_then(|v| v.as_str())
+            .map(str::to_string))
+    }
+
     pub async fn secret_exists(&self, name: &str) -> Result<bool> {
         let secrets = self
             .podman()

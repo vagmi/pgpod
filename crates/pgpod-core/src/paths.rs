@@ -155,6 +155,82 @@ pub mod container {
     pub const SECRET_REPLICATION: &str = "/run/secrets/pgpod-replication";
     pub const SECRET_MONITOR: &str = "/run/secrets/pgpod-monitor";
     pub const SECRET_APP_OWNER: &str = "/run/secrets/pgpod-app-owner";
+
+    /// The pg_doorman admin console password, for this pooler.
+    pub const SECRET_POOLER_ADMIN: &str = "/run/secrets/pgpod-pooler-admin";
+
+    /// The `auth_query` lookup role's password, one per fronted cluster.
+    ///
+    /// Indexed rather than named, for the reason `Destination` credentials
+    /// are: the podman secret's *name* is a host concept that means
+    /// nothing inside the container, and a pooler may front several
+    /// clusters (ADR 05 §2).
+    pub fn pooler_lookup_secret(index: usize) -> String {
+        format!("/run/secrets/pgpod-pooler-lookup-{index}")
+    }
+
+    /// The pooler container's writable directory — a tmpfs, because the
+    /// rootfs is read-only and nothing here outlives the container.
+    ///
+    /// A tmpfs rather than a volume because there is genuinely no durable
+    /// state: the config is re-rendered from `PGPOD_POOLER_SPEC` and the
+    /// mounted secrets on every start. Verified on podman 5.7 that a
+    /// fresh tmpfs mounts `1777`, so a non-root uid can write it — which
+    /// is also why the agent sets the config's own mode rather than
+    /// inheriting one (ADR 05 §5).
+    pub const POOLER_DIR: &str = "/pooler";
+
+    /// The agent-rendered pg_doorman configuration.
+    ///
+    /// **Not** a bind mount from the host, and this is not a style
+    /// preference: rootless podman maps the host user to container UID 0,
+    /// so a container running as uid 999 gets `Permission denied` reading
+    /// a file owned by the host user. A podman secret is chowned
+    /// correctly but is fixed at container-create time, leaving `RELOAD`
+    /// nothing new to read. Rendering in-container is the only delivery
+    /// that is both readable and rewritable (ADR 05 §5).
+    pub const POOLER_CONF: &str = "/pooler/pg_doorman.yaml";
+
+    /// Mode the rendered config is written with. It carries the
+    /// `auth_query` and admin passwords in plaintext, because that is the
+    /// only form pg_doorman accepts.
+    pub const POOLER_CONF_MODE: u32 = 0o600;
+
+    /// The pooler agent's control socket.
+    ///
+    /// The daemon reaches it by `podman exec`, the way `status.rs`
+    /// already execs into an instance. PID 1 answers, which is what lets
+    /// a pause carry a deadline that outlives the exec that asked for it
+    /// (ADR 05, consequences).
+    pub const POOLER_CONTROL_SOCKET: &str = "/pooler/agent.sock";
+
+    /// Port pg_doorman listens on inside the container.
+    pub const POOLER_PORT: u16 = 6432;
+
+    /// pg_doorman's own admin database, reached on the same port.
+    pub const POOLER_ADMIN_DB: &str = "pgdoorman";
+
+    /// The admin console user pgpod creates for itself.
+    pub const POOLER_ADMIN_USER: &str = "pgpod_admin";
+
+    /// pg_doorman inside the upstream image.
+    pub const POOLER_BIN: &str = "/usr/bin/pg_doorman";
+
+    /// Default pooler image.
+    ///
+    /// Pinned rather than `latest`: the pooler is on the data path, and a
+    /// tag that moves underneath a restart is not something to discover
+    /// during an incident.
+    pub const DEFAULT_POOLER_IMAGE: &str = "ghcr.io/ozontech/pg_doorman:v3.11.0";
+
+    /// UID/GID the pooler container runs as.
+    ///
+    /// Any non-root uid works — pg_doorman writes only to the tmpfs — but
+    /// it must be set explicitly for the same reason the instance's is:
+    /// the image declares no `USER`, and container-root cannot read a
+    /// 0400 secret once `cap_drop: ALL` removes `CAP_DAC_OVERRIDE`.
+    pub const DEFAULT_POOLER_UID: u32 = 999;
+    pub const DEFAULT_POOLER_GID: u32 = 999;
 }
 
 /// Host-side layout for pgpod's own state.

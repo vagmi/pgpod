@@ -7,8 +7,11 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use pgpod_control::{ApplyReport, BackupReport, ClusterStatus, DeleteReport, Pgpod, RestoreReport};
-use pgpod_core::{ClusterId, ClusterManifest, InstanceId};
+use pgpod_control::{
+    ApplyOptions, ApplyReport, BackupReport, ClusterStatus, DeleteReport, Pgpod, PoolerReport,
+    RestoreReport,
+};
+use pgpod_core::{ClusterId, InstanceId, Manifest, PoolerId};
 use pgpod_runtime::ExecSpec;
 use serde::Serialize;
 
@@ -34,16 +37,64 @@ impl CommandOutput for ApplyReport {
     }
 }
 
-pub async fn apply(path: &str, wait_secs: u64) -> Result<ApplyReport> {
+/// What one `apply -f` produced, whichever kind the file declared.
+///
+/// `untagged`, so `-o json` prints the report itself rather than wrapping
+/// it in a discriminant. A script that already parses an apply report
+/// should not have to learn a new envelope because poolers exist.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum Applied {
+    Cluster(ApplyReport),
+    Pooler(PoolerReport),
+}
+
+impl CommandOutput for Applied {
+    fn to_text(&self) -> String {
+        match self {
+            Self::Cluster(r) => r.to_text(),
+            Self::Pooler(r) => r.to_text(),
+        }
+    }
+}
+
+/// Apply a manifest of either kind.
+///
+/// Dispatching on `kind` here rather than asking the operator which
+/// command to run: a manifest says what it is, and needing a different
+/// verb for a file that already declares its own kind is an invitation to
+/// get it wrong.
+pub async fn apply(path: &str, wait_secs: u64, recreate: bool) -> Result<Applied> {
     let yaml =
         std::fs::read_to_string(path).with_context(|| format!("could not read manifest {path}"))?;
-    let manifest = ClusterManifest::from_yaml(&yaml)
+    let manifest = Manifest::from_yaml(&yaml)
         .with_context(|| format!("{path} is not a valid pgpod manifest"))?;
 
     let pgpod = Pgpod::open()?;
-    Ok(pgpod
-        .apply(&manifest, Duration::from_secs(wait_secs))
-        .await?)
+    let wait = Duration::from_secs(wait_secs);
+    match manifest {
+        Manifest::Cluster(m) => Ok(Applied::Cluster(
+            pgpod
+                .apply_with(&m, ApplyOptions { wait, recreate })
+                .await?,
+        )),
+        Manifest::Pooler(m) => {
+            if recreate {
+                // Refused rather than ignored. Recreating a pooler is the
+                // one operation it cannot hold for, so a flag that sounds
+                // like "do it gracefully" must not be the thing that drops
+                // every pooled connection.
+                bail!(
+                    "--recreate applies to clusters, not poolers. Replacing a \
+                     pooler drops every connection through it, because there is \
+                     nothing in front of the pooler to hold them: \
+                     `pgpod pooler delete {}` then apply again.",
+                    m.metadata.name
+                );
+            }
+            Ok(Applied::Pooler(pgpod.apply_pooler(&m, wait).await?))
+        }
+    }
 }
 
 // ---- backup ---------------------------------------------------------
@@ -237,8 +288,31 @@ impl CommandOutput for ClusterStatus {
                 );
             }
         }
+        if !self.poolers.is_empty() {
+            out.push_str("\npoolers:\n");
+            for p in &self.poolers {
+                out.push_str(&format!(
+                    "  {:<12} {:<9} port {}\n",
+                    p.pooler,
+                    if p.running { "running" } else { "stopped" },
+                    p.host_port,
+                ));
+                for uri in &p.connection_uris {
+                    out.push_str(&format!("    {uri}\n"));
+                }
+            }
+        }
         if let Some(uri) = self.primary_uri() {
             out.push_str(&format!("\nprimary:    {uri}\n"));
+            // Both, deliberately. The pooler is where applications belong
+            // — it is what lets a recreate hold connections instead of
+            // dropping them — but the direct URI keeps working when the
+            // pooler does not, which is the property ADR 02 §6 bought.
+            if let Some(p) = self.poolers.iter().find(|p| p.running) {
+                if let Some(pooled) = p.connection_uris.first() {
+                    out.push_str(&format!("pooled:     {pooled}\n"));
+                }
+            }
         }
         if !self.recent_events.is_empty() {
             out.push_str("\nrecent events:\n");
@@ -323,6 +397,15 @@ impl CommandOutput for DeleteReport {
                  `pgpod delete --purge` destroys it.\n",
             );
         }
+        if !self.poolers.is_empty() {
+            out.push_str(&format!(
+                "\nStill fronted by: {}\n\
+                 Those poolers now point at an instance that is not running, so \
+                 clients\nthrough them will fail until `pgpod apply` brings it \
+                 back.\n",
+                self.poolers.join(", ")
+            ));
+        }
         out
     }
 }
@@ -331,6 +414,181 @@ pub async fn delete(cluster: &str, purge: bool) -> Result<DeleteReport> {
     let pgpod = Pgpod::open()?;
     let id = ClusterId::new(cluster)?;
     Ok(pgpod.delete(&id, purge).await?)
+}
+
+// ---- pooler ---------------------------------------------------------
+
+impl CommandOutput for PoolerReport {
+    fn to_text(&self) -> String {
+        let verb = if self.created { "created" } else { "converged" };
+        let mut out = format!(
+            "pooler '{}' {} (generation {})\n  container {}\n",
+            self.pooler, verb, self.generation, self.container
+        );
+        for p in &self.pools {
+            out.push_str(&format!(
+                "  pool {}  ->  cluster {} database {}\n    {}\n",
+                p.name, p.cluster, p.database, p.connection_uri
+            ));
+        }
+        out.push_str("\nApplications connect to the pool name, not the database name.\n");
+        out
+    }
+}
+
+pub async fn pooler_list() -> Result<PoolerList> {
+    let pgpod = Pgpod::open()?;
+    let mut out = Vec::new();
+    for record in pgpod.poolers().await? {
+        out.push(PoolerSummary {
+            pooler: record.name,
+            container: record.container_name,
+            host_port: record.host_port,
+            phase: record.phase,
+            pools: record
+                .pools
+                .into_iter()
+                .map(|p| format!("{} -> {}/{}", p.pool_name, p.cluster, p.database))
+                .collect(),
+        });
+    }
+    Ok(PoolerList { poolers: out })
+}
+
+#[derive(Serialize)]
+pub struct PoolerList {
+    pub poolers: Vec<PoolerSummary>,
+}
+
+#[derive(Serialize)]
+pub struct PoolerSummary {
+    pub pooler: String,
+    pub container: String,
+    pub host_port: u16,
+    pub phase: String,
+    pub pools: Vec<String>,
+}
+
+impl CommandOutput for PoolerList {
+    fn to_text(&self) -> String {
+        if self.poolers.is_empty() {
+            return "no poolers\n".to_string();
+        }
+        let mut out = String::new();
+        for p in &self.poolers {
+            out.push_str(&format!(
+                "{}  {}  port {}\n",
+                p.pooler, p.phase, p.host_port
+            ));
+            for pool in &p.pools {
+                out.push_str(&format!("  {pool}\n"));
+            }
+        }
+        out
+    }
+}
+
+/// `SHOW POOLS`, live from the pooler.
+#[derive(Serialize)]
+pub struct PoolerPools {
+    pools: Vec<pgpod_pooler::PoolStatus>,
+}
+
+impl CommandOutput for PoolerPools {
+    fn to_text(&self) -> String {
+        let pools = &self.pools;
+        if pools.is_empty() {
+            // Not an error, and worth saying why: pg_doorman creates a
+            // pool on the first client connection, so an idle pooler
+            // legitimately has none.
+            return "no pools are instantiated yet — pg_doorman creates one on \
+                    the first client connection\n"
+                .to_string();
+        }
+        let mut out = format!(
+            "{:<20} {:<12} {:>7} {:>8} {:>8} {:>8}\n",
+            "pool", "user", "paused", "waiting", "active", "idle"
+        );
+        for p in pools {
+            out.push_str(&format!(
+                "{:<20} {:<12} {:>7} {:>8} {:>8} {:>8}\n",
+                p.database, p.user, p.paused, p.clients_waiting, p.servers_active, p.servers_idle,
+            ));
+        }
+        out
+    }
+}
+
+pub async fn pooler_pools(pooler: &str) -> Result<PoolerPools> {
+    let pgpod = Pgpod::open()?;
+    let id = PoolerId::new(pooler)?;
+    Ok(PoolerPools {
+        pools: pgpod.pooler_pools(&id).await?,
+    })
+}
+
+#[derive(Serialize)]
+pub struct PoolerAction {
+    pub pooler: String,
+    pub cluster: String,
+    pub action: String,
+}
+
+impl CommandOutput for PoolerAction {
+    fn to_text(&self) -> String {
+        format!(
+            "{} pools for cluster '{}' on pooler '{}'\n",
+            self.action, self.cluster, self.pooler
+        )
+    }
+}
+
+pub async fn pooler_pause(pooler: &str, cluster: &str) -> Result<PoolerAction> {
+    let pgpod = Pgpod::open()?;
+    let id = PoolerId::new(pooler)?;
+    let c = ClusterId::new(cluster)?;
+    pgpod.pooler_pause(&id, &c).await?;
+    Ok(PoolerAction {
+        pooler: pooler.to_string(),
+        cluster: cluster.to_string(),
+        action: "paused".into(),
+    })
+}
+
+pub async fn pooler_resume(pooler: &str, cluster: &str) -> Result<PoolerAction> {
+    let pgpod = Pgpod::open()?;
+    let id = PoolerId::new(pooler)?;
+    let c = ClusterId::new(cluster)?;
+    pgpod.pooler_resume(&id, &c).await?;
+    Ok(PoolerAction {
+        pooler: pooler.to_string(),
+        cluster: cluster.to_string(),
+        action: "resumed".into(),
+    })
+}
+
+#[derive(Serialize)]
+pub struct PoolerDeleted {
+    pub pooler: String,
+}
+
+impl CommandOutput for PoolerDeleted {
+    fn to_text(&self) -> String {
+        format!(
+            "pooler '{}' deleted\n\nNothing durable was destroyed: a pooler has \
+             no volume and re-renders its config on every start.\n",
+            self.pooler
+        )
+    }
+}
+
+pub async fn pooler_delete(pooler: &str) -> Result<PoolerDeleted> {
+    let pgpod = Pgpod::open()?;
+    let id = PoolerId::new(pooler)?;
+    pgpod.delete_pooler(&id).await?;
+    Ok(PoolerDeleted {
+        pooler: pooler.to_string(),
+    })
 }
 
 // ---- exec / logs / volume -------------------------------------------

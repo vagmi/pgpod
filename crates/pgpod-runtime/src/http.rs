@@ -35,6 +35,17 @@
 //! one is the point at which to replace `podman-api` rather than keep
 //! patching around it — recorded in ROADMAP.
 //!
+//! **A third endpoint, and this one is a gap rather than a defect.**
+//! Reading a secret back needs `?showsecret=true`, and `podman-api`'s
+//! `Secret::inspect` requests `/libpod/secrets/{id}/json` without it, so
+//! the response never carries `SecretData`. Nothing is wrong with the
+//! crate; it simply does not expose the query parameter, and the endpoint
+//! is a plain GET that shares the response parser below.
+//!
+//! It is needed because a restored cluster carries the *source's* roles
+//! verbatim, so its credentials have to be adopted rather than generated
+//! (ADR 04 §8).
+//!
 //! Do not add endpoints here casually.
 
 use std::path::Path;
@@ -53,20 +64,35 @@ pub(crate) async fn post_json(socket: &Path, path: &str, body: &str) -> Result<(
 ///
 /// `/libpod/secrets/create` takes the secret's bytes as the body, not a
 /// JSON document containing them.
-pub(crate) async fn post_bytes(
-    socket: &Path,
-    path: &str,
-    body: &[u8],
-) -> Result<(u16, String)> {
+pub(crate) async fn post_bytes(socket: &Path, path: &str, body: &[u8]) -> Result<(u16, String)> {
     post(socket, path, "application/octet-stream", body).await
 }
 
-async fn post(
-    socket: &Path,
-    path: &str,
-    content_type: &str,
-    body: &[u8],
-) -> Result<(u16, String)> {
+/// GET from the libpod socket and return `(status, body)`.
+///
+/// Callers branch on the status: 404 is a normal answer for "no such
+/// object", not a transport failure.
+pub(crate) async fn get(socket: &Path, path: &str) -> Result<(u16, String)> {
+    let mut stream = UnixStream::connect(socket)
+        .await
+        .map_err(|e| Error::Unreachable(format!("connect {}: {e}", socket.display())))?;
+
+    let head = format!("GET {path} HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|e| Error::Unreachable(format!("write request: {e}")))?;
+
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .map_err(|e| Error::Unreachable(format!("read response: {e}")))?;
+
+    parse_response(&raw)
+}
+
+async fn post(socket: &Path, path: &str, content_type: &str, body: &[u8]) -> Result<(u16, String)> {
     let mut stream = UnixStream::connect(socket)
         .await
         .map_err(|e| Error::Unreachable(format!("connect {}: {e}", socket.display())))?;

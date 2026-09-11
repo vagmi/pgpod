@@ -276,6 +276,14 @@ pub enum SpecError {
 
     #[error("the instance spec is self-contradictory: {0}")]
     Inconsistent(String),
+
+    /// The same failure for a pooler.
+    ///
+    /// A separate variant purely for the noun: every pooler spec error
+    /// used to open with "the instance spec is self-contradictory", which
+    /// sends an operator looking at the wrong manifest.
+    #[error("the pooler spec is self-contradictory: {0}")]
+    PoolerInconsistent(String),
 }
 
 #[cfg(test)]

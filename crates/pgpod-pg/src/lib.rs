@@ -20,7 +20,10 @@ pub use conf::{
 };
 pub use hba::{AuthMethod, HbaConfig};
 pub use initdb::{InitdbOptions, PWFILE_PATH};
-pub use roles::{AppDatabase, BootstrapRoles, MONITOR_ROLE, REPLICATION_ROLE};
+pub use roles::{
+    AppDatabase, BootstrapRoles, MONITOR_ROLE, POOLER_ROLE, REPLICATION_ROLE,
+    alter_role_password_sql, pooler_lookup_function, pooler_lookup_sql,
+};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Error {

@@ -100,13 +100,25 @@ impl PodmanClient {
             .collect())
     }
 
-    /// Remove a network. Safe: podman refuses while containers are
-    /// attached, and a network holds no data.
+    /// Remove a network, but only while nothing is attached to it.
+    ///
+    /// **`delete()`, not `remove()`** — the third `podman-api` naming trap
+    /// after `no_new_privilages` and the secret encoding (ADR 00 §8). The
+    /// crate's own doc on `Network::remove` reads "Force remove this
+    /// network removing associated containers. To delete network normally
+    /// use `Network::delete`", so the method whose name suggests the
+    /// gentler operation is the destructive one.
+    ///
+    /// pgpod called `remove()` while its caller's comment asserted that
+    /// podman would refuse a network with containers attached. It does
+    /// refuse — for `delete()`. That was latent only because nothing but
+    /// the instances ever joined a cluster network; a pooler does, and
+    /// `pgpod delete <cluster>` destroyed it.
     pub async fn remove_network(&self, name: &str) -> Result<()> {
         self.podman()
             .networks()
             .get(name)
-            .remove()
+            .delete()
             .await
             .map(|_| ())
             .map_err(|e| Error::Network(format!("remove {name}: {e}")))

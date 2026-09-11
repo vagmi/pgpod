@@ -1,0 +1,54 @@
+# A connection pooler in front of a cluster.
+#
+# The pooler is its own object with its own name and lifecycle, and it
+# names the clusters it fronts — never the other way round, so applying a
+# cluster manifest can never reconfigure a pooler it does not mention
+# (ADR 05 §2).
+#
+# What it buys, beyond pooling: `pgpod apply --recreate` can change a
+# running cluster's spec while clients wait at the pooler instead of being
+# disconnected. Measured on the deployment target, the same recreate lost
+# 32 of 66 transactions without a pooler and 0 of 22 with one.
+#
+#   pgpod apply -f examples/backup-local.yaml
+#   pgpod apply -f examples/pooler.yaml
+#   psql "postgresql://app@127.0.0.1:6432/appdb"
+#
+apiVersion: pgpod/v1
+kind: Pooler
+metadata:
+  name: app
+spec:
+  # Every cluster this pooler serves. Each gets its own pg_doorman pool,
+  # its own podman network, and its own lookup credential — nothing is
+  # shared between them.
+  clusters:
+    - cluster: demo-backed-up
+      # `pools` omitted means the cluster's bootstrap.initdb.database.
+      # Spell them out when a cluster has more than one, or when two
+      # clusters would otherwise export the same pool name:
+      #
+      #   pools:
+      #     - database: appdb
+      #       as: demo-appdb   # what clients put in dbname
+
+  # Loopback port applications connect to. Omit it and pgpod allocates
+  # one, then keeps it across recreates.
+  port: 6432
+
+  pgDoorman:
+    # `transaction` releases the backend at COMMIT, which is what makes a
+    # small pool serve many clients. Use `session` for applications that
+    # rely on session state (SET, advisory locks, WITH HOLD cursors).
+    poolMode: transaction
+    poolSize: 40
+
+    # How long a client waits for a backend — under ordinary pool
+    # pressure, *and* during a switchover hold. One setting, because
+    # pg_doorman has one: `query_wait_timeout` is captured when pools are
+    # constructed and is not re-read on reload (ADR 05 §3).
+    #
+    # A recreate that takes longer than this fails clients instead of
+    # holding them. Changing it recreates the pooler, which drops pooled
+    # connections — the one operation a pooler cannot hold for.
+    maxHold: "60s"

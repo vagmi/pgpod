@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pgpod_core::ClusterManifest;
+use pgpod_core::{ClusterManifest, Manifest, PoolerManifest};
 
 fn examples_dir() -> PathBuf {
     // CARGO_MANIFEST_DIR is crates/pgpod-core.
@@ -31,26 +31,76 @@ fn examples() -> Vec<PathBuf> {
     out
 }
 
-fn parsed() -> Vec<(PathBuf, ClusterManifest)> {
+/// Every example, parsed through the same dispatch `pgpod apply -f` uses.
+///
+/// Through `Manifest` rather than `ClusterManifest`: the examples
+/// directory holds more than one kind now, and a test that assumed
+/// otherwise would fail on a perfectly good pooler example — which is
+/// exactly what it did when the first one landed.
+fn all() -> Vec<(PathBuf, Manifest)> {
     examples()
         .into_iter()
         .map(|path| {
             let yaml = std::fs::read_to_string(&path).expect("read example");
-            let m = ClusterManifest::from_yaml(&yaml)
+            let m = Manifest::from_yaml(&yaml)
                 .unwrap_or_else(|e| panic!("{} does not parse:\n  {e}", path.display()));
             (path, m)
         })
         .collect()
 }
 
+fn parsed() -> Vec<(PathBuf, ClusterManifest)> {
+    all()
+        .into_iter()
+        .filter_map(|(path, m)| match m {
+            Manifest::Cluster(c) => Some((path, *c)),
+            Manifest::Pooler(_) => None,
+        })
+        .collect()
+}
+
+fn poolers() -> Vec<(PathBuf, PoolerManifest)> {
+    all()
+        .into_iter()
+        .filter_map(|(path, m)| match m {
+            Manifest::Pooler(p) => Some((path, *p)),
+            Manifest::Cluster(_) => None,
+        })
+        .collect()
+}
+
 #[test]
 fn every_shipped_example_parses() {
-    let found = parsed();
+    let found = all();
     assert!(
         !found.is_empty(),
         "no examples found in {}",
         examples_dir().display()
     );
+}
+
+#[test]
+fn both_manifest_kinds_are_demonstrated() {
+    // A reader copies from here. The pooler is the difference between a
+    // recreate that drops connections and one that holds them, so there
+    // has to be an example of it.
+    assert!(!parsed().is_empty(), "no cluster example");
+    assert!(!poolers().is_empty(), "no pooler example");
+}
+
+#[test]
+fn every_pooler_example_declares_a_hold_budget_with_a_unit() {
+    // A bare number is milliseconds to pg_doorman. The manifest refuses
+    // one, so this really asserts that the examples teach the unit rather
+    // than leaving a reader to find out.
+    for (path, m) in poolers() {
+        assert!(
+            m.spec.pg_doorman.max_hold.as_millis() >= 1000,
+            "{}: a maxHold under a second is almost certainly a missing \
+             unit — pg_doorman reads a bare number as milliseconds",
+            path.display()
+        );
+    }
 }
 
 #[test]

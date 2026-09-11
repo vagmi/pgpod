@@ -399,6 +399,27 @@ impl PodmanClient {
         while let Some(chunk) = stream.next().await {
             chunk.map_err(|e| Error::Container(format!("pull {image}: {e}")))?;
         }
+
+        // **Assert the outcome, do not trust the report.** libpod's pull
+        // endpoint answers 200 and reports a failed pull as an `error`
+        // field *inside* the streamed body, so a stream that ends without
+        // a transport error does not mean the image arrived. Left at that,
+        // a mistyped tag surfaced three calls later as `create returned
+        // HTTP 404: image not known` — which names the wrong operation and
+        // sends whoever reads it looking at the container spec.
+        if !self
+            .podman()
+            .images()
+            .get(image)
+            .exists()
+            .await
+            .unwrap_or(false)
+        {
+            return Err(Error::Container(format!(
+                "pulled {image} but it is still not present — check the name \
+                 and tag exist in the registry, and that this host can reach it"
+            )));
+        }
         Ok(())
     }
 
@@ -560,8 +581,7 @@ impl PodmanClient {
         let json: serde_json::Value = serde_json::from_str(&payload)
             .map_err(|e| Error::Container(format!("re-parse create options: {e}")))?;
 
-        let json =
-            patch_create_payload(json, spec.no_new_privileges, spec.log_driver.as_deref())?;
+        let json = patch_create_payload(json, spec.no_new_privileges, spec.log_driver.as_deref())?;
 
         let body = json.to_string();
         let (status, response) = crate::http::post_json(
@@ -782,8 +802,7 @@ mod tests {
         // `pgbackrest info --output=json`, which the control plane parses
         // and journald's LineMax would truncate.
         for hardened in [true, false] {
-            let out =
-                patch_create_payload(built_payload(), hardened, Some("k8s-file")).unwrap();
+            let out = patch_create_payload(built_payload(), hardened, Some("k8s-file")).unwrap();
             assert_eq!(
                 out.pointer("/log_configuration/driver"),
                 Some(&serde_json::json!("k8s-file")),

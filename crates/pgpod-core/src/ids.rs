@@ -169,6 +169,55 @@ impl FromStr for InstanceId {
     }
 }
 
+/// Stable identifier for a pooler.
+///
+/// A pooler is its own object rather than a field of a cluster (ADR 05
+/// §2), so it gets its own name and its own namespace of podman objects.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PoolerId(String);
+
+impl PoolerId {
+    /// Same rules as [`ClusterId::new`]. Deliberately identical: a pooler
+    /// name has fewer downstream constraints (it never becomes a
+    /// replication slot), but two near-identical name grammars in one
+    /// manifest format is a worse trade than one strict grammar.
+    pub fn new(name: impl Into<String>) -> Result<Self, ParseInstanceIdError> {
+        let name = name.into();
+        ClusterId::new(name.clone())
+            .map_err(|_| ParseInstanceIdError::BadPoolerName(name.clone()))?;
+        Ok(Self(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Podman container name.
+    ///
+    /// `pgpod-pooler-<name>`, not `pgpod-<name>`. An instance container is
+    /// `pgpod-<cluster>-<ordinal>`, so a pooler innocently named `mydb-2`
+    /// would otherwise claim the container name of `mydb`'s second
+    /// instance — and the collision would surface as podman refusing a
+    /// create, naming neither object.
+    pub fn container_name(&self) -> String {
+        format!("pgpod-pooler-{}", self.0)
+    }
+}
+
+impl fmt::Display for PoolerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for PoolerId {
+    type Err = ParseInstanceIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ParseInstanceIdError {
     #[error(
@@ -176,6 +225,12 @@ pub enum ParseInstanceIdError {
          starting with a letter and not ending in '-'"
     )]
     BadClusterName(String),
+
+    #[error(
+        "invalid pooler name {0:?}: expected 1-40 characters of [a-z0-9-], \
+         starting with a letter and not ending in '-'"
+    )]
+    BadPoolerName(String),
 
     #[error("invalid instance id {0:?}: expected <cluster>-<ordinal>, e.g. \"mydb-1\"")]
     MissingOrdinal(String),
@@ -243,6 +298,38 @@ mod tests {
             let id: InstanceId = s.parse().expect("parses");
             assert_eq!(id.to_string(), s);
         }
+    }
+
+    #[test]
+    fn a_pooler_can_never_claim_an_instances_container_name() {
+        // The reason for the `pgpod-pooler-` prefix. A pooler named
+        // `mydb-2` is a perfectly reasonable thing to write, and without
+        // the prefix it would collide with the second instance of `mydb`
+        // — surfacing as podman refusing a create, naming neither object.
+        let pooler = PoolerId::new("mydb-2").expect("valid pooler name");
+        let instance = cluster("mydb").instance(2);
+        assert_eq!(pooler.container_name(), "pgpod-pooler-mydb-2");
+        assert_ne!(pooler.container_name(), instance.container_name());
+    }
+
+    #[test]
+    fn pooler_names_follow_the_same_grammar_as_clusters() {
+        for name in ["MyDb", "my_db", "1db", "db-", "my.db", ""] {
+            assert!(PoolerId::new(name).is_err(), "{name} should be rejected");
+        }
+        assert_eq!(PoolerId::new("app-rw").expect("valid").as_str(), "app-rw");
+    }
+
+    #[test]
+    fn a_bad_pooler_name_says_pooler_not_cluster() {
+        // The manifest field that was wrong is the one the operator has to
+        // edit; reporting "invalid cluster name" for `metadata.name` on a
+        // Pooler sends them to the wrong file.
+        let err = PoolerId::new("Bad_Name").unwrap_err();
+        assert!(
+            err.to_string().contains("pooler name"),
+            "message should name the pooler field: {err}"
+        );
     }
 
     #[test]

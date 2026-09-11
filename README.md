@@ -17,6 +17,10 @@ Kubernetes runtime carrying it.
 > Ubuntu 26.04 with podman 5.7 — against a local repository and against
 > [Garage](https://garagehq.deuxfleurs.fr/) over S3.
 >
+> A [pg_doorman](https://github.com/ozontech/pg_doorman) pooler can sit in
+> front, which is what lets `pgpod apply --recreate` change a running
+> cluster's configuration **without dropping a connection**.
+>
 > **Not yet:** replicas, failover, a reconciling daemon, or scheduled
 > backups — `pgpod backup` is something you run. See
 > [`ROADMAP.md`](ROADMAP.md).
@@ -112,6 +116,78 @@ Debian, on a CNPG-based image, and on Alpine.
 A `file://` repository needs `spec.backup.volume`: inside a container with
 a read-only root filesystem, a local path exists only if something is
 mounted there. pgpod never deletes that volume — not even `--purge`.
+
+A restored cluster keeps the roles that were in the backup, so it is
+reachable with the **source cluster's** credentials: `pgpod restore` copies
+those secrets onto the new cluster's names rather than inventing passwords
+no role has. Restoring onto a machine that does not have them — the
+repository is self-describing, so the backup may be all you brought —
+generates fresh ones and rotates the roles to match, saying so in
+`pgpod status`. Either way the URI `pgpod status` prints is one you can
+actually connect with.
+
+### Connection pooling, and changing a running cluster
+
+The instance spec reaches the container in an environment variable fixed
+when the container is created, so changing a manifest means **replacing**
+the container. `pgpod apply` refuses to pretend otherwise:
+
+```
+Error: demo-1 is running a different spec than the manifest describes …
+  parameters: [] -> [("work_mem", "8MB")]
+```
+
+Pooler allows short downtimes for clusters. You can define a pooler like so.
+
+```yaml
+apiVersion: pgpod/v1
+kind: Pooler
+metadata: { name: app }
+spec:
+  clusters: [{ cluster: demo }]
+  port: 6432
+  pgDoorman:
+    poolMode: transaction
+    maxHold: "60s"
+```
+
+```sh
+pgpod apply -f examples/pooler.yaml
+psql postgresql://app@127.0.0.1:6432/appdb     # through the pooler
+
+pgpod apply -f cluster.yaml --recreate         # holds, replaces, releases
+```
+
+`--recreate` pauses the pooler's pools for that cluster, replaces the
+container, waits for PostgreSQL, recycles the backends and resumes.
+Clients wait instead of being disconnected. On the deployment target the
+same recreate lost **32 of 66** transactions with nothing in front, and
+**0 of 73** with a pooler holding.
+
+`maxHold` is the budget for that window — and, because pg_doorman has one
+setting for both, also how long a client waits for a backend under
+ordinary pool pressure. A recreate that overruns it fails clients rather
+than holding them, which is stated rather than discovered.
+
+Clients authenticate with scram-sha-256 all the way through: pgpod creates
+a `pgpod_pooler` role with a `SECURITY DEFINER` lookup, and pg_doorman
+verifies the client and replays its ClientKey to PostgreSQL. No password
+or verifier is copied anywhere.
+
+One pooler can front several clusters — each gets its own pool, its own
+podman network and its own credential — but one per cluster stays the
+default, because one pooler process failing takes every cluster it fronts
+off its pooled endpoint. Instance ports stay published either way, so a
+pooler that is down degrades pooling and not availability.
+
+A pool is addressed by the name a client puts in `dbname`, which defaults
+to the database's own name. Two clusters that both call their database
+`appdb` therefore collide, and pgpod refuses the manifest rather than
+picking a name you did not write; `as:` renames either one.
+
+**Why pg_doorman** and not PgBouncer or pgcat: it authenticates clients
+with scram-sha-256. pgcat is MD5-only on the client side, which would mean
+md5-encoding every role's password to put it in front of a pgpod cluster.
 
 ### Custom images
 
