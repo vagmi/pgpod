@@ -314,6 +314,18 @@ pub struct ContainerProbe {
     /// Reading it back is how the reconciler learns that a running
     /// container is enacting an older manifest than the one just applied.
     pub env: Vec<String>,
+    /// The **ID** of the image this container was created from.
+    ///
+    /// The image is the one part of a manifest that does not travel in
+    /// the instance spec, so it is the one thing a spec comparison cannot
+    /// see. Compared as an ID rather than a name because a name is not a
+    /// stable identity: `postgres:18` and
+    /// `docker.io/library/postgres:18` are the same image, and the same
+    /// tag can be repointed by a pull.
+    pub image_id: Option<String>,
+    /// The image's name as podman resolved it, for messages. Never for
+    /// comparisons — see `image_id`.
+    pub image_name: Option<String>,
 }
 
 impl ContainerProbe {
@@ -421,6 +433,25 @@ impl PodmanClient {
             )));
         }
         Ok(())
+    }
+
+    /// The ID of a locally present image, by any name it answers to.
+    ///
+    /// `None` when the image is not on this host. Resolving a name to an
+    /// ID is what makes "is this container running the image the manifest
+    /// names?" answerable: the two sides spell the name differently
+    /// (`postgres:18` against `docker.io/library/postgres:18`), and a tag
+    /// can be repointed under both of them.
+    pub async fn image_id(&self, image: &str) -> Result<Option<String>> {
+        let handle = self.podman().images().get(image);
+        if !handle.exists().await.unwrap_or(false) {
+            return Ok(None);
+        }
+        let data = handle
+            .inspect()
+            .await
+            .map_err(|e| Error::Container(format!("inspect image {image}: {e}")))?;
+        Ok(data.id)
     }
 
     /// Create a container from `spec`. Created, not started.
@@ -684,6 +715,8 @@ impl Container {
             status: state.as_ref().and_then(|s| s.status.clone()),
             exit_code: state.as_ref().and_then(|s| s.exit_code),
             env,
+            image_id: data.image,
+            image_name: data.image_name,
         }))
     }
 

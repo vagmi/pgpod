@@ -13,17 +13,19 @@ mod conf;
 mod hba;
 mod initdb;
 mod roles;
+mod upgrade;
 
 pub use conf::{
     ArchiveMode, INCLUDE_DIR_LINE, MANAGED_CONF_FILE, ManagedConf, RESERVED_PARAMETERS,
     RecoveryConf, StandbyConf, USER_CONF_FILE, archive_command, render_user_conf, restore_command,
 };
 pub use hba::{AuthMethod, HbaConfig};
-pub use initdb::{InitdbOptions, PWFILE_PATH};
+pub use initdb::{DataChecksums, InitdbOptions, PWFILE_PATH};
 pub use roles::{
     AppDatabase, BootstrapRoles, MONITOR_ROLE, POOLER_ROLE, REPLICATION_ROLE,
     alter_role_password_sql, pooler_lookup_function, pooler_lookup_sql,
 };
+pub use upgrade::PgUpgradePlan;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Error {

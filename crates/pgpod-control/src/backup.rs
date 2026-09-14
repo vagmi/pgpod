@@ -155,11 +155,18 @@ impl Pgpod {
     }
 
     /// Restore `source` into a new cluster, optionally at a point in time.
+    ///
+    /// `image` overrides the image the restored cluster runs. It exists
+    /// for one situation and is worth the parameter for it: after a major
+    /// upgrade, the stanza holds backups of *two* PostgreSQL versions, and
+    /// the older ones can only be restored into the older major version —
+    /// which is no longer what the source cluster's manifest names.
     pub async fn restore(
         &self,
         source: &ClusterId,
         target: &ClusterId,
         at: Option<chrono::DateTime<chrono::Utc>>,
+        image: Option<&str>,
         wait: Duration,
     ) -> Result<RestoreReport> {
         if source == target {
@@ -210,6 +217,40 @@ impl Pgpod {
             ))
         })?;
 
+        // **Which PostgreSQL can read this backup.** A stanza that has
+        // been through `stanza-upgrade` holds backups from before the
+        // upgrade as well as after, and pgBackRest will happily restore
+        // either — producing, for an older one, a data directory the
+        // manifest's image refuses to start with `database files are
+        // incompatible with server`. That error names neither the backup
+        // nor the upgrade, and arrives after the restore has finished.
+        //
+        // Refused here instead, with the version to ask for. An unknown
+        // version (a repository older than this check) is not treated as
+        // a match: it is left alone, because refusing every restore from
+        // an older repository would be worse than the failure mode.
+        let backup_version = info.version_of(&chosen).map(str::to_string);
+        let restored_image = match image {
+            Some(i) => i.trim().to_string(),
+            None => source_manifest.spec.image_name.clone(),
+        };
+        if image.is_none()
+            && let (Some(backup_v), Some(current_v)) = (&backup_version, info.current_version())
+            && backup_v != current_v
+        {
+            return Err(Error::Invalid(format!(
+                "backup {} is PostgreSQL {backup_v}, but {source} runs {current_v} \
+                 now — its repository has been through a major upgrade. \
+                 PostgreSQL cannot read a data directory from an older major \
+                 version, so restoring this backup needs a {backup_v} image:\n\n  \
+                 pgpod restore {source} --as {target} --image <a PostgreSQL \
+                 {backup_v} image>\n\n\
+                 A target after the upgrade restores onto {current_v} with no \
+                 --image.",
+                chosen.label
+            )));
+        }
+
         // The restored cluster is a real cluster with its own name, its own
         // stanza and its own secrets. `bootstrap.initdb` is inherited
         // rather than cleared: it is not used to create anything — the
@@ -218,6 +259,7 @@ impl Pgpod {
         // came out of the backup.
         let mut target_manifest = source_manifest.clone();
         target_manifest.metadata.name = target.to_string();
+        target_manifest.spec.image_name = restored_image;
 
         let recovery = RecoveryBootstrap {
             source_stanza: source.to_string(),
@@ -263,7 +305,7 @@ impl Pgpod {
     ///
     /// The outer `Result` is pgpod failing to run the container at all; the
     /// inner one is pgBackRest failing. They need different fixes.
-    async fn run_pgbackrest(
+    pub(crate) async fn run_pgbackrest(
         &self,
         manifest: &ClusterManifest,
         cluster: &ClusterId,

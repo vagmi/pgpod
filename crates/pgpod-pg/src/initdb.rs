@@ -41,15 +41,54 @@ impl Default for InitdbOptions {
     }
 }
 
+/// Whether the cluster stores data page checksums.
+///
+/// Not a preference on the upgrade path: `pg_upgrade` refuses when the
+/// two clusters disagree, so the new cluster's setting is dictated by the
+/// old one's `pg_controldata`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataChecksums {
+    On,
+    Off,
+}
+
 impl InitdbOptions {
-    /// Full argv for `initdb`, including the program name.
+    /// Full argv for bootstrapping a pgpod instance's own PGDATA.
+    ///
+    /// Checksums are on and the superuser password comes from a file —
+    /// both non-negotiable here, which is why this is a distinct entry
+    /// point from [`Self::argv_for`] rather than a defaulted call of it.
+    pub fn argv(&self) -> Vec<String> {
+        self.argv_for(container::PGDATA, Some(PWFILE_PATH), DataChecksums::On, 0)
+    }
+
+    /// Full argv for `initdb` into an arbitrary directory.
+    ///
+    /// `pg_upgrade` needs a second cluster created beside the first, with
+    /// the same encoding and locale and **no** password file: the new
+    /// cluster's roles arrive from the old one's dump, so writing a fresh
+    /// superuser password here would be overwritten a minute later and
+    /// would leave a cleartext password in the volume in the meantime.
+    ///
+    /// `target_major` is the version of the `initdb` being invoked. It
+    /// matters for exactly one flag: PostgreSQL 18 turned checksums on by
+    /// default and added `--no-data-checksums` to turn them off, and no
+    /// earlier release accepts that spelling. Passing it to a 17 `initdb`
+    /// is an error; omitting it on 18 silently produces a cluster
+    /// `pg_upgrade` then refuses.
     ///
     /// Empty `encoding` or `locale` fall back to the defaults rather than
     /// being passed through. `--encoding=` is a hard initdb error, but
     /// `--locale=` *succeeds* and silently inherits the container's
     /// environment — producing a glibc-dependent collation where `C` was
     /// intended. A setting that fails safe is worth the two lines.
-    pub fn argv(&self) -> Vec<String> {
+    pub fn argv_for(
+        &self,
+        pgdata: &str,
+        pwfile: Option<&str>,
+        checksums: DataChecksums,
+        target_major: u32,
+    ) -> Vec<String> {
         let encoding = if self.encoding.trim().is_empty() {
             "UTF8"
         } else {
@@ -63,18 +102,28 @@ impl InitdbOptions {
         let mut v = vec![
             "initdb".to_string(),
             "--pgdata".to_string(),
-            container::PGDATA.to_string(),
+            pgdata.to_string(),
             format!("--username={}", self.superuser),
             format!("--encoding={encoding}"),
             format!("--locale={locale}"),
-            // Not negotiable — see the module docs.
-            "--data-checksums".to_string(),
             // Local connections are `peer`; TCP is scram. Matches the
             // pg_hba pgpod renders immediately afterwards.
             "--auth-local=peer".to_string(),
             "--auth-host=scram-sha-256".to_string(),
-            format!("--pwfile={PWFILE_PATH}"),
         ];
+        match checksums {
+            // Not negotiable on the bootstrap path — see the module docs.
+            DataChecksums::On => v.push("--data-checksums".to_string()),
+            // Only 18 and later have the flag, because only they default
+            // the other way.
+            DataChecksums::Off if target_major >= 18 => {
+                v.push("--no-data-checksums".to_string());
+            }
+            DataChecksums::Off => {}
+        }
+        if let Some(pwfile) = pwfile {
+            v.push(format!("--pwfile={pwfile}"));
+        }
         v.extend(self.extra.iter().cloned());
         v
     }
@@ -168,5 +217,44 @@ mod tests {
         for a in &argv {
             assert!(!a.ends_with('='), "empty flag value reached initdb: {a:?}");
         }
+    }
+
+    #[test]
+    fn a_second_data_directory_can_be_created_without_a_password_file() {
+        // The pg_upgrade path: roles arrive from the old cluster's dump,
+        // so a fresh password here would be both pointless and cleartext
+        // in the volume until it was overwritten.
+        let argv =
+            InitdbOptions::default().argv_for("/pgdata/pgdata.new", None, DataChecksums::On, 18);
+        let idx = argv.iter().position(|a| a == "--pgdata").unwrap();
+        assert_eq!(argv[idx + 1], "/pgdata/pgdata.new");
+        assert!(!argv.iter().any(|a| a.starts_with("--pwfile")), "{argv:?}");
+        assert!(argv.contains(&"--data-checksums".to_string()));
+    }
+
+    #[test]
+    fn checksums_off_only_spells_the_flag_versions_that_have_it_understand() {
+        // PostgreSQL 18 defaults checksums *on* and added
+        // --no-data-checksums; 17 defaults off and rejects the flag
+        // outright. Getting this backwards produces either an initdb that
+        // fails or a cluster pg_upgrade refuses for a checksum mismatch.
+        let on_18 = InitdbOptions::default().argv_for("/d", None, DataChecksums::Off, 18);
+        assert!(
+            on_18.contains(&"--no-data-checksums".to_string()),
+            "{on_18:?}"
+        );
+
+        let on_17 = InitdbOptions::default().argv_for("/d", None, DataChecksums::Off, 17);
+        assert!(
+            !on_17.iter().any(|a| a.contains("checksums")),
+            "17 has no way to say it, and defaults to off: {on_17:?}"
+        );
+    }
+
+    #[test]
+    fn the_bootstrap_path_still_gets_checksums_and_a_password_file() {
+        let argv = InitdbOptions::default().argv();
+        assert!(argv.contains(&"--data-checksums".to_string()));
+        assert!(argv.iter().any(|a| a == &format!("--pwfile={PWFILE_PATH}")));
     }
 }

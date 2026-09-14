@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use pgpod_control::{
     ApplyOptions, ApplyReport, BackupReport, ClusterStatus, DeleteReport, Pgpod, PoolerReport,
-    RestoreReport,
+    RestoreReport, UpgradeOptions, UpgradeReport,
 };
 use pgpod_core::{ClusterId, InstanceId, Manifest, PoolerId};
 use pgpod_runtime::ExecSpec;
@@ -236,6 +236,7 @@ pub async fn restore(
     source: &str,
     target: &str,
     at: Option<&str>,
+    image: Option<&str>,
     wait_secs: u64,
 ) -> Result<RestoreReport> {
     let source_id = ClusterId::new(source.to_string())?;
@@ -257,7 +258,13 @@ pub async fn restore(
 
     let pgpod = Pgpod::open()?;
     Ok(pgpod
-        .restore(&source_id, &target_id, at, Duration::from_secs(wait_secs))
+        .restore(
+            &source_id,
+            &target_id,
+            at,
+            image,
+            Duration::from_secs(wait_secs),
+        )
         .await?)
 }
 
@@ -728,4 +735,75 @@ pub fn psql(cluster: &str, database: Option<&str>) -> Result<std::convert::Infal
         "could not run `podman` — pgpod uses it for interactive sessions only; \
          is it on PATH?",
     )
+}
+
+// ---- upgrade --------------------------------------------------------
+
+impl CommandOutput for UpgradeReport {
+    fn to_text(&self) -> String {
+        let mut out = String::new();
+        if self.checked_only {
+            out.push_str(&format!(
+                "cluster '{}' can be upgraded {} -> {} ({} mode)\n\
+                 \n  nothing was changed: this was `--check`\n",
+                self.cluster, self.from_version, self.to_version, self.method
+            ));
+        } else {
+            out.push_str(&format!(
+                "cluster '{}' upgraded PostgreSQL {} -> {}\n\
+                 \n  image:        {} -> {}\n  method:       {}\n",
+                self.cluster,
+                self.from_version,
+                self.to_version,
+                self.from_image,
+                self.to_image,
+                self.method
+            ));
+        }
+        out.push_str(&format!(
+            "  pg_upgrade:   {}s\n  clients held: {} ms by {} pooler(s)\n  staged:       {} MiB\n",
+            self.upgrade_seconds,
+            self.held_ms,
+            self.poolers_held,
+            self.staged_bytes / (1024 * 1024),
+        ));
+        if self.poolers_held == 0 && !self.checked_only {
+            out.push_str("                (no pooler: open connections were dropped)\n");
+        }
+        if !self.old_data_dir.is_empty() {
+            // Named rather than deleted: pgpod does not remove data it did
+            // not create, and in copy mode this directory is the way back.
+            out.push_str(&format!(
+                "  old cluster:  {} (kept, inside the instance volume)\n",
+                self.old_data_dir
+            ));
+        }
+        if !self.checked_only {
+            out.push_str(&format!(
+                "  statistics:   {}\n",
+                if self.analyzed {
+                    "rebuilt with vacuumdb --analyze-in-stages"
+                } else {
+                    "NOT rebuilt"
+                }
+            ));
+            match &self.backup_label {
+                Some(label) => out.push_str(&format!("  new backup:   {label}\n")),
+                None => out.push_str("  new backup:   none\n"),
+            }
+        }
+        for w in &self.warnings {
+            out.push_str(&format!("\n! {w}\n"));
+        }
+        if !self.checked_only {
+            out.push_str(&format!("\nConnect with:  pgpod psql {}\n", self.cluster));
+        }
+        out
+    }
+}
+
+pub async fn upgrade(cluster: &str, options: UpgradeOptions) -> Result<UpgradeReport> {
+    let id = ClusterId::new(cluster.to_string())?;
+    let pgpod = Pgpod::open()?;
+    Ok(pgpod.upgrade(&id, options).await?)
 }

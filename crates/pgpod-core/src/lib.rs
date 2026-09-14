@@ -14,6 +14,7 @@ mod paths;
 mod pooler;
 mod secret;
 mod spec;
+mod upgrade;
 
 pub use backup::{
     BACKUP_SPEC_ENV, BackupJobSpec, BackupSpec, Destination, RetentionMode,
@@ -31,3 +32,7 @@ pub use paths::{PathLayout, container};
 pub use pooler::{POOLER_SPEC_ENV, PoolTarget, PoolerSpec};
 pub use secret::Secret;
 pub use spec::{Bootstrap, InitdbBootstrap, InstanceSpec, RecoveryBootstrap, SPEC_ENV, SpecError};
+pub use upgrade::{
+    ProbeReport, REPORT_MARKER, StageReport, UPGRADE_SPEC_ENV, UpgradeMethod, UpgradeRunReport,
+    UpgradeSpec, major_label, parse_report, print_report, version_key,
+};

@@ -14,6 +14,10 @@
 #   pgpod apply -f examples/pooler.yaml
 #   psql "postgresql://app@127.0.0.1:6432/appdb"
 #
+# The same hold covers a major-version upgrade, which is the longer of the
+# two windows: `pgpod upgrade demo-backed-up --to-image postgres:18` held
+# clients for 5.4 seconds here, 1 second of it inside pg_upgrade (ADR 06).
+#
 apiVersion: pgpod/v1
 kind: Pooler
 metadata:

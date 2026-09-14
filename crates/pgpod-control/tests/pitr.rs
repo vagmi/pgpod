@@ -245,7 +245,7 @@ async fn a_cluster_can_be_restored_to_a_point_in_time() {
         .with_timezone(&chrono::Utc);
 
     let restore = pg
-        .restore(&cluster, &restored, Some(at), READY_TIMEOUT)
+        .restore(&cluster, &restored, Some(at), None, READY_TIMEOUT)
         .await
         .expect("restore");
     assert_eq!(restore.backup_label, label);
@@ -592,7 +592,7 @@ spec:
         .with_timezone(&chrono::Utc);
 
     let restore = pg
-        .restore(&cluster, &restored, Some(at), READY_TIMEOUT)
+        .restore(&cluster, &restored, Some(at), None, READY_TIMEOUT)
         .await
         .expect("restore from garage");
     assert_eq!(restore.backup_label, label);
@@ -721,7 +721,7 @@ async fn a_restore_without_the_source_secrets_rotates_the_roles() {
             .unwrap_or_else(|e| panic!("remove {secret}: {e}"));
     }
 
-    pg.restore(&cluster, &restored, None, READY_TIMEOUT)
+    pg.restore(&cluster, &restored, None, None, READY_TIMEOUT)
         .await
         .expect("restore without the source's secrets");
     let restored_instance = format!("{restored_name}-1");

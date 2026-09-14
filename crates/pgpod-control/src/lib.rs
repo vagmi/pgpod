@@ -8,6 +8,7 @@ mod names;
 mod password;
 mod pooler;
 mod status;
+mod upgrade;
 
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ pub use backup::{BackupReport, RestoreReport};
 pub use names::{LABEL_CLUSTER, LABEL_INSTANCE, LABEL_POOLER, SecretNames};
 pub use pooler::{PoolSummary, PoolerHold, PoolerReport};
 pub use status::{ClusterStatus, InstanceStatus, PoolerStatus};
+pub use upgrade::{UpgradeOptions, UpgradeReport};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -48,6 +50,9 @@ pub enum Error {
 
     #[error("pgbackrest {command} failed\n\n{detail}")]
     PgBackRest { command: String, detail: String },
+
+    #[error("the {step} step of the upgrade failed\n\n{detail}")]
+    Upgrade { step: String, detail: String },
 
     #[error(
         "the pgBackRest bundle is not installed at {0} — build it with \
@@ -75,8 +80,12 @@ pub enum Error {
         "{instance} is running a different spec than the manifest describes, and \
          the spec is fixed when the container is created — a restart would \
          re-run the agent with the old one.\n\n{detail}\n\n\
-         Recreate the instance to apply this: `pgpod delete <cluster>` keeps \
-         the volume and the data, then `pgpod apply -f <manifest>`."
+         Applying this means replacing the container:\n\n  \
+         pgpod apply -f <manifest> --recreate\n\n\
+         With a pooler in front, clients are held across that window rather \
+         than dropped (ADR 05). Without one, every open connection goes. \
+         `pgpod delete <cluster>` followed by `pgpod apply` does the same \
+         thing the long way and keeps the volume either way."
     )]
     Diverged { instance: String, detail: String },
 
@@ -153,6 +162,17 @@ pub(crate) struct ApplyContext<'a> {
     agent: &'a std::path::Path,
     /// Whether a diverged instance may be recreated in place.
     recreate: bool,
+    /// The ID `spec.imageName` resolves to on this host.
+    ///
+    /// Carried because the image is **not** part of [`InstanceSpec`] — it
+    /// belongs to the container, not to the agent's instructions — so the
+    /// spec comparison that catches every other manifest change cannot
+    /// see it. Without this, editing `imageName` and applying reports
+    /// "converged" and changes nothing.
+    ///
+    /// `None` only if the image vanished between the pull and here, in
+    /// which case the comparison is skipped rather than guessed at.
+    desired_image_id: Option<String>,
 }
 
 /// How one `apply` should behave.
@@ -284,6 +304,37 @@ impl Pgpod {
         let agent = self.agent_binary()?;
 
         let existed = self.registry.cluster(&cluster)?.is_some();
+
+        // The image is the one part of a manifest that does **not** travel
+        // in the instance spec, so the comparison that catches every other
+        // change cannot see it. It is resolved to an ID here, once, and
+        // compared against what each container was actually created from
+        // — not against what pgpod recorded. The registry stores what the
+        // last apply *asked for*, which is not the same thing: an apply
+        // that failed on its image recorded that image anyway, and
+        // trusting it made the retry see no change and repeat the failure
+        // (found by doing exactly that).
+        self.podman
+            .pull_image_if_absent(&manifest.spec.image_name)
+            .await?;
+        let desired_image_id = self.podman.image_id(&manifest.spec.image_name).await?;
+
+        // A changed image is the one manifest edit that can be a
+        // major-version change, and `apply` cannot make one: starting a
+        // newer PostgreSQL on an older data directory fails with
+        // `database files are incompatible with server`, leaving an
+        // instance that never becomes ready. Checked before anything is
+        // created — and before the manifest is recorded, so a refusal
+        // leaves nothing behind to confuse the next attempt.
+        //
+        // Not conditioned on the registry knowing this cluster: what
+        // constrains the image is the *volume*, and a volume can outlive
+        // the registry — a host that lost its SQLite still has its data
+        // (ADR 04 §5). The check reads that volume and returns
+        // immediately when there is nothing in it.
+        self.refuse_incompatible_image(&cluster, manifest, desired_image_id.as_deref())
+            .await?;
+
         let generation = self.registry.put_cluster(manifest, "applying")?;
         self.registry
             .record_event(cluster.as_str(), None, "info", "apply requested")?;
@@ -316,6 +367,7 @@ impl Pgpod {
             secrets,
             agent: &agent,
             recreate: options.recreate,
+            desired_image_id: desired_image_id.clone(),
         };
 
         let mut summaries = Vec::new();
@@ -435,11 +487,43 @@ impl Pgpod {
                 }
                 Err(e) => return Err(e),
             },
-            Some(p) => {
-                Self::refuse_if_diverged(manifest, instance, ctx, &p)?;
-                self.podman.container(&p.id).start().await?;
-                p.id
-            }
+            Some(p) => match Self::refuse_if_diverged(manifest, instance, ctx, &p) {
+                Ok(()) => {
+                    self.podman.container(&p.id).start().await?;
+                    p.id
+                }
+                Err(e) => {
+                    // A **stopped** container that no longer matches the
+                    // manifest is replaced without `--recreate` being
+                    // asked for, because the reason that flag exists does
+                    // not apply here: there is no outage to cause. This
+                    // container is already down, and starting it would
+                    // re-run the agent with the stale spec — the exact
+                    // thing `refuse_if_diverged` exists to prevent.
+                    //
+                    // It is also the way back from a mistake. An `apply`
+                    // that named an incompatible image leaves an exited
+                    // container behind; putting the old image back in the
+                    // manifest and applying it has to be enough, or the
+                    // operator is told to `delete` a cluster in order to
+                    // fix it.
+                    self.registry.record_event(
+                        cluster.as_str(),
+                        Some(instance.ordinal()),
+                        "info",
+                        &format!("stopped instance diverged, recreating: {e}"),
+                    )?;
+                    let spec = self.container_spec(manifest, instance, ctx, host_port)?;
+                    self.podman
+                        .pull_image_if_absent(&manifest.spec.image_name)
+                        .await?;
+                    let handle = self.podman.container(&p.id);
+                    handle.remove(true).await?;
+                    let c = self.podman.create_container(&spec).await?;
+                    c.start().await?;
+                    c.id().to_string()
+                }
+            },
             None => {
                 let spec = self.container_spec(manifest, instance, ctx, host_port)?;
                 self.podman
@@ -645,21 +729,28 @@ impl Pgpod {
     /// recreating it, which is right: recreating a healthy instance is a
     /// pointless outage. But the instance spec travels in an environment
     /// variable fixed at **container-create** time (`pgpod_core::spec`),
-    /// so changing anything in it — parameters, preload libraries, image,
-    /// a backup destination — needs the container *recreated*, not merely
+    /// so changing anything in it — parameters, preload libraries, a
+    /// backup destination — needs the container *recreated*, not merely
     /// restarted. A restart re-runs the agent with the stale value.
     ///
-    /// Nothing detected that until now, so `apply` would report success
-    /// and change nothing. Adding a backup destination to a live cluster
-    /// is the case that makes it dangerous rather than merely confusing:
-    /// the operator sees "apply complete", believes their WAL is being
-    /// archived, and finds out otherwise at the restore.
+    /// Nothing detected that until Phase 2, so `apply` would report
+    /// success and change nothing. Adding a backup destination to a live
+    /// cluster is the case that makes it dangerous rather than merely
+    /// confusing: the operator sees "apply complete", believes their WAL
+    /// is being archived, and finds out otherwise at the restore.
     ///
-    /// Phase 2 does not solve reconfiguration — the fix is `delete` (which
-    /// keeps the volume and the data) followed by `apply`. What it does is
-    /// refuse to pretend. The real version, which knows that
+    /// **The image is not in that environment variable** — it belongs to
+    /// the container, not to the agent's instructions — so it is compared
+    /// separately, against the image ID this container was created from.
+    /// It was missed entirely for the same reason it is easy to miss
+    /// here: a spec comparison cannot see a field the spec does not have,
+    /// and editing `imageName` therefore reported "converged" and changed
+    /// nothing (ADR 06 §9).
+    ///
+    /// The remedy is `--recreate`, which holds clients at the pooler
+    /// across the replacement (ADR 05). The version that knows
     /// `archive_command` is reloadable while `archive_mode` and
-    /// `shared_preload_libraries` are restart-only, belongs with the
+    /// `shared_preload_libraries` are restart-only belongs with the
     /// reconciler in Phase 4.
     fn refuse_if_diverged(
         manifest: &ClusterManifest,
@@ -684,13 +775,29 @@ impl Pgpod {
         let running: InstanceSpec = serde_json::from_str(running)
             .map_err(|e| Error::Spec(pgpod_core::SpecError::Malformed(e.to_string())))?;
 
-        if running == desired {
+        // The image is not in the spec — it belongs to the container, not
+        // to the agent's instructions — so it is compared separately,
+        // against what this container was actually created from. Left
+        // out, a changed `imageName` was adopted silently and `apply`
+        // reported success for a manifest it had not applied.
+        let image_change = match (&ctx.desired_image_id, &probe.image_id) {
+            (Some(desired), Some(running)) if desired != running => Some((
+                probe
+                    .image_name
+                    .clone()
+                    .unwrap_or_else(|| short_id(running)),
+                manifest.spec.image_name.clone(),
+            )),
+            _ => None,
+        };
+
+        if running == desired && image_change.is_none() {
             return Ok(());
         }
 
         Err(Error::Diverged {
             instance: instance.to_string(),
-            detail: differences(&running, &desired).join("\n"),
+            detail: differences(&running, &desired, image_change.as_ref()).join("\n"),
         })
     }
 
@@ -1161,17 +1268,33 @@ fn archive_volume(manifest: &ClusterManifest, spec: &InstanceSpec) -> Option<Str
     volume
 }
 
+/// An image ID, shortened the way podman prints one.
+///
+/// Only ever for a message: an image with no name is still an image, and
+/// 64 hex characters in an error tells an operator less than 12 do.
+fn short_id(id: &str) -> String {
+    id.trim_start_matches("sha256:").chars().take(12).collect()
+}
+
 /// Name what changed between two specs.
 ///
 /// A diff rather than "they differ": the operator has to decide whether a
 /// recreate is worth an outage, and cannot without knowing what moved.
-fn differences(running: &InstanceSpec, desired: &InstanceSpec) -> Vec<String> {
+fn differences(
+    running: &InstanceSpec,
+    desired: &InstanceSpec,
+    image_change: Option<&(String, String)>,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut note = |field: &str, from: String, to: String| {
         if from != to {
             out.push(format!("  {field}: {from} -> {to}"));
         }
     };
+
+    if let Some((from, to)) = image_change {
+        note("image", from.clone(), to.clone());
+    }
 
     note(
         "bootstrap",
@@ -1291,6 +1414,38 @@ mod tests {
 
     fn manifest(yaml: &str) -> ClusterManifest {
         ClusterManifest::from_yaml(yaml).unwrap()
+    }
+
+    #[test]
+    fn a_changed_image_is_named_in_the_diff() {
+        // The image is not in the instance spec, so it is the one
+        // manifest change the spec comparison cannot see. An operator who
+        // edits `imageName` has to read what pgpod thinks changed and
+        // recognise their own edit in it.
+        let spec = |port: u16| InstanceSpec {
+            instance: ClusterId::new("mydb").unwrap().instance(1),
+            port,
+            bootstrap: Bootstrap::Initdb(Default::default()),
+            parameters: Vec::new(),
+            shared_preload_libraries: Vec::new(),
+            network_cidr: None,
+            archive_command: None,
+            backup: Default::default(),
+        };
+        let change = (
+            "docker.io/library/postgres:17".to_string(),
+            "docker.io/library/postgres:18".to_string(),
+        );
+        let out = differences(&spec(5432), &spec(5432), Some(&change)).join("\n");
+        assert!(
+            out.contains("image: docker.io/library/postgres:17 -> docker.io/library/postgres:18"),
+            "{out}"
+        );
+
+        // And it is the *only* thing reported when it is the only change:
+        // a diff that also listed identical fields would train operators
+        // to skim past it.
+        assert_eq!(out.lines().count(), 1, "{out}");
     }
 
     #[test]

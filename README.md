@@ -19,7 +19,9 @@ Kubernetes runtime carrying it.
 >
 > A [pg_doorman](https://github.com/ozontech/pg_doorman) pooler can sit in
 > front, which is what lets `pgpod apply --recreate` change a running
-> cluster's configuration **without dropping a connection**.
+> cluster's configuration **without dropping a connection** — and what
+> makes `pgpod upgrade` carry a cluster from PostgreSQL 17 to 18 with
+> clients waiting rather than failing.
 >
 > **Not yet:** replicas, failover, a reconciling daemon, or scheduled
 > backups — `pgpod backup` is something you run. See
@@ -46,6 +48,7 @@ pgpod status mydb
 pgpod backup mydb
 pgpod backups mydb
 pgpod restore mydb --at '2026-09-04T10:00:00Z' --as mydb-restored
+pgpod upgrade mydb --to-image docker.io/library/postgres:18
 ```
 
 Designed for clusters that can tolerate a small amount of downtime.
@@ -188,6 +191,87 @@ picking a name you did not write; `as:` renames either one.
 **Why pg_doorman** and not PgBouncer or pgcat: it authenticates clients
 with scram-sha-256. pgcat is MD5-only on the client side, which would mean
 md5-encoding every role's password to put it in front of a pgpod cluster.
+
+### Major-version upgrades
+
+```sh
+pgpod upgrade mydb --to-image docker.io/library/postgres:18 --check   # rehearse
+pgpod upgrade mydb --to-image docker.io/library/postgres:18
+```
+
+```
+cluster 'mydb' upgraded PostgreSQL 17 -> 18
+
+  image:        postgres:17-bookworm -> postgres:18
+  method:       link
+  pg_upgrade:   1s
+  clients held: 5394 ms by 1 pooler(s)
+  staged:       80 MiB
+  old cluster:  /pgdata/pgdata.old-17-1789164558 (kept, inside the instance volume)
+  statistics:   rebuilt with vacuumdb --analyze-in-stages
+  new backup:   20260911-220926F
+```
+
+It is `pg_upgrade`, run in a job container, with the pooler holding
+clients across the window. `--link` hard-links the data files rather than
+copying them, so the window does not grow with the database — 5 seconds
+here, and the same 5 seconds for a cluster a hundred times the size.
+
+The part that needs explaining is that **`pg_upgrade` needs both major
+versions' binaries at once, and no PostgreSQL image has both**. pgpod
+stages the old image's installation into the instance volume from a
+container running that image — while the cluster is still serving — and
+then runs `pg_upgrade` in the new image with the instance stopped. The old
+binaries take their own shared libraries with them, because a Debian 12
+PostgreSQL wants `libicuuc.so.72` and a Debian 13 image has only `.76`.
+Before any data moves, pgpod runs the staged `pg_ctl --version` to prove
+the old binaries work in the new image, and refuses the upgrade if they do
+not.
+
+Everything that can refuse refuses **before** the hold: a downgrade, an
+image of the same major version (that is `apply --recreate`), a cluster
+with standbys, a missing backup. `--check` rehearses the whole thing with
+`pg_upgrade --check` and puts the cluster back as it was.
+
+**Editing `imageName` and running `apply` does not do this**, and says so:
+
+```
+$ pgpod apply -f cluster.yaml          # imageName bumped 17 -> 18
+Error: mydb holds a PostgreSQL 17 data directory, and postgres:18 is
+PostgreSQL 18. `apply` cannot make that change: it would start the new
+server on the old data, which fails with "database files are incompatible
+with server".
+
+A major version needs pg_upgrade, which is a different operation with a
+different window:
+
+  pgpod upgrade mydb --to-image postgres:18
+
+Nothing has been changed — the data directory is still PostgreSQL 17.
+```
+
+A **same**-major image change — a minor-version patch, a different base —
+is an ordinary spec change: `apply` reports it as a divergence and
+`apply --recreate` applies it, with the pooler holding clients across the
+swap.
+
+Afterwards, `pgbackrest stanza-upgrade` runs inside the window so WAL
+keeps reaching the repository, a full backup is taken, and
+`vacuumdb --analyze-in-stages` rebuilds the planner statistics
+`pg_upgrade` does not carry over. The pre-upgrade data directory is kept
+inside the volume and never removed by pgpod.
+
+One consequence worth knowing: the repository now holds backups of two
+PostgreSQL versions, and an older one can only be restored by the version
+that wrote it. pgpod refuses the mismatch rather than handing you a data
+directory that will not start:
+
+```sh
+pgpod restore mydb --as mydb-old --at '2026-09-11T22:09:10Z' \
+    --image docker.io/library/postgres:17-bookworm
+```
+
+See [ADR 06](adrs/06-major-version-upgrades.md).
 
 ### Custom images
 

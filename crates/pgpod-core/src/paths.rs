@@ -77,6 +77,55 @@ pub mod container {
     /// opening a SQL connection per probe (ADR 02 §7).
     pub const STATUS_SOCKET: &str = "/pgdata/conf/agent.sock";
 
+    /// Scratch for a major-version upgrade, inside the instance volume.
+    ///
+    /// Inside the volume rather than in a volume of its own, for two
+    /// reasons. The staged installation has to be visible to a container
+    /// running a *different image* — which the instance volume already is,
+    /// because every job container mounts it — and a scratch volume would
+    /// be a volume pgpod created and would then have to delete, which
+    /// principle 4 says it must not do implicitly. A directory it made
+    /// itself, it can remove.
+    pub const UPGRADE_DIR: &str = "/pgdata/upgrade";
+
+    /// Root of the staged copy of the **old** image's PostgreSQL
+    /// installation.
+    ///
+    /// Everything under it mirrors its original absolute path — the old
+    /// `bin` lands at `<root>/usr/lib/postgresql/17/bin` and not at
+    /// `<root>/bin`. That is not tidiness: PostgreSQL locates its
+    /// `share` directory *relative to its own executable*, by stripping
+    /// the compiled-in `bindir` suffix from where it actually is. Staged
+    /// flat, the old postmaster computes the compiled-in path instead and
+    /// dies with `could not open directory
+    /// "/usr/share/postgresql/17/timezonesets"` — an error about the new
+    /// image lacking a directory that belongs to the old one (ADR 06 §2).
+    pub const UPGRADE_STAGE_DIR: &str = "/pgdata/upgrade/old";
+
+    /// Wrappers for the staged old binaries, and `pg_upgrade`'s `-b`.
+    ///
+    /// Each is a two-line shell script that exports `LD_LIBRARY_PATH`
+    /// pointing at the staged libraries and execs the real staged binary.
+    /// Scoping it this way rather than setting it for the whole job is
+    /// what keeps the *new* binaries on the new image's libraries —
+    /// `pg_dump` picking up the old image's `libpq` would be a silent
+    /// hazard rather than a loud one (ADR 06 §3).
+    pub const UPGRADE_WRAPPER_DIR: &str = "/pgdata/upgrade/bin";
+
+    /// The new cluster, while `pg_upgrade` is building it.
+    ///
+    /// A sibling of [`PGDATA`] inside the same volume, which is also what
+    /// makes `--link` possible: hard links cannot cross filesystems.
+    pub const PGDATA_NEW: &str = "/pgdata/pgdata.new";
+
+    /// Prefix for the pre-upgrade data directory, which is kept.
+    ///
+    /// `pgpod` never deletes it. In `copy` mode it is the way back, and
+    /// in `link` mode it is what `pg_upgrade` renamed `global/pg_control`
+    /// inside — unusable as a cluster, and still the evidence that the
+    /// upgrade happened.
+    pub const PGDATA_OLD_PREFIX: &str = "/pgdata/pgdata.old-";
+
     /// Where the static agent binary is bind-mounted read-only.
     pub const AGENT_BIN: &str = "/usr/local/bin/pgpod-agent";
 

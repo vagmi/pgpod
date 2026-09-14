@@ -13,6 +13,9 @@
 //!    supervises it, and serves a control socket. Same division of labour,
 //!    different container (ADR 05 §5). The remaining `pooler` subcommands
 //!    are clients of that socket, run by the daemon through `podman exec`.
+//! 3. **Upgrade jobs** (`upgrade stage|probe|run`) — the two halves of a
+//!    `pg_upgrade`, one in the old image and one in the new, because no
+//!    image carries both major versions (ADR 06).
 //!
 //! It no longer ships WAL or takes base backups. PostgreSQL invokes
 //! pgBackRest directly as `archive_command` and `restore_command`, and
@@ -28,6 +31,7 @@ mod recovery;
 mod secrets;
 mod status;
 mod supervise;
+mod upgrade;
 
 use std::time::Duration;
 
@@ -51,6 +55,25 @@ enum Command {
     /// Pooler lifecycle and control.
     #[command(subcommand)]
     Pooler(PoolerCommand),
+
+    /// Major-version upgrade. Each subcommand is the entrypoint of a job
+    /// container, and which *image* it runs in is half of what it does
+    /// (ADR 06).
+    #[command(subcommand)]
+    Upgrade(UpgradeCommand),
+}
+
+#[derive(Subcommand)]
+enum UpgradeCommand {
+    /// Copy this image's PostgreSQL installation into the volume. Runs in
+    /// the **old** image, beside a running instance.
+    Stage,
+    /// Report what PostgreSQL this image carries. Runs in the **new**
+    /// image, before anything is stopped.
+    Probe,
+    /// Run `pg_upgrade`. Runs in the **new** image, with the instance
+    /// stopped, and is the only step that touches data.
+    Run,
 }
 
 #[derive(Subcommand)]
@@ -98,6 +121,9 @@ async fn main() -> Result<()> {
         }
         Command::Pooler(PoolerCommand::Run) => pooler::run().await,
         Command::Pooler(other) => control(other).await,
+        Command::Upgrade(UpgradeCommand::Stage) => upgrade::stage(),
+        Command::Upgrade(UpgradeCommand::Probe) => upgrade::probe(),
+        Command::Upgrade(UpgradeCommand::Run) => upgrade::run(),
     }
 }
 

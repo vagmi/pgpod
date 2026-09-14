@@ -29,6 +29,32 @@ pub struct StanzaInfo {
     pub archive: Vec<ArchiveInfo>,
     #[serde(default)]
     pub status: Status,
+    /// The stanza's version history, newest last.
+    ///
+    /// A stanza gains an entry every time `stanza-upgrade` runs, which is
+    /// once per major-version upgrade. It is what makes a repository
+    /// self-describing across an upgrade: a backup taken before one can
+    /// still be restored, but only into that older PostgreSQL, and
+    /// without this nothing knows which.
+    #[serde(default)]
+    pub db: Vec<DbHistory>,
+}
+
+/// One PostgreSQL version this stanza has held.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DbHistory {
+    pub id: i64,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default, rename = "system-id")]
+    pub system_id: Option<u64>,
+}
+
+/// Which history entry a backup belongs to.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BackupDb {
+    #[serde(default)]
+    pub id: i64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -75,6 +101,9 @@ pub struct Backup {
     pub archive: Option<BackupArchive>,
     #[serde(default)]
     pub info: Option<BackupSize>,
+    /// The stanza history entry this backup was taken against.
+    #[serde(default)]
+    pub database: BackupDb,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,6 +180,30 @@ impl StanzaInfo {
     /// `None` when nothing qualifies, rather than a best guess: pgBackRest
     /// will refuse a target it cannot reach anyway, and failing here gives
     /// a message that names the backups that *do* exist.
+    /// The PostgreSQL major version a backup can be restored into.
+    ///
+    /// `None` for a repository written before pgpod read this field, or by
+    /// a pgBackRest that did not report it — treated as "unknown" rather
+    /// than as "matches", so a missing value never silently approves a
+    /// restore into the wrong major version.
+    pub fn version_of(&self, backup: &Backup) -> Option<&str> {
+        self.db
+            .iter()
+            .find(|d| d.id == backup.database.id)
+            .map(|d| d.version.as_str())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// The version the stanza is on now — the one a new backup would be
+    /// taken against.
+    pub fn current_version(&self) -> Option<&str> {
+        self.db
+            .iter()
+            .max_by_key(|d| d.id)
+            .map(|d| d.version.as_str())
+            .filter(|v| !v.is_empty())
+    }
+
     pub fn backup_for_target(&self, at: Option<DateTime<Utc>>) -> Option<Backup> {
         self.backups_oldest_first()
             .into_iter()
@@ -198,6 +251,7 @@ mod tests {
               "repository": {"delta": 3000000, "size": 3000000},
               "size": 24000000
             },
+            "database": {"id": 1, "repo-key": 1},
             "label": "20260904-020000F",
             "prior": null,
             "timestamp": {"start": 1788487200, "stop": 1788487215},
@@ -213,13 +267,15 @@ mod tests {
               "repository": {"delta": 20000, "size": 3100000},
               "size": 24500000
             },
+            "database": {"id": 2, "repo-key": 1},
             "label": "20260904-020000F_20260905-020000I",
             "timestamp": {"start": 1788573600, "stop": 1788573605},
             "type": "incr"
           }
         ],
         "cipher": "none",
-        "db": [{"id": 1, "version": "18"}],
+        "db": [{"id": 1, "version": "17", "system-id": 7684403096010190901},
+               {"id": 2, "version": "18", "system-id": 7684403255280009269}],
         "name": "mydb",
         "status": {"code": 0, "message": "ok"}
       }
@@ -334,5 +390,35 @@ mod tests {
         // so they must not look alike.
         assert!(parse_info("not json").is_err());
         assert!(parse_info("").is_err());
+    }
+
+    #[test]
+    fn a_backup_knows_which_major_version_it_can_be_restored_into() {
+        // After a major upgrade one stanza holds backups of two different
+        // PostgreSQL versions. Restoring the older one into the newer
+        // image produces a data directory the server refuses to start,
+        // with an error that names neither the backup nor the upgrade.
+        let s = stanza(SAMPLE, "mydb").unwrap().unwrap();
+        let backups = s.backups_oldest_first();
+        assert_eq!(s.version_of(&backups[0]), Some("17"));
+        assert_eq!(s.version_of(&backups[1]), Some("18"));
+        assert_eq!(
+            s.current_version(),
+            Some("18"),
+            "the newest history entry is the version a new backup lands on"
+        );
+    }
+
+    #[test]
+    fn an_unknown_version_is_none_rather_than_a_match() {
+        // A repository written before pgpod read this field must not be
+        // silently approved for a restore into any version.
+        let json = r#"[{"name":"mydb","archive":[],"db":[],"backup":[
+          {"label":"20260904-020000F","type":"full",
+           "timestamp":{"start":1,"stop":2}}]}]"#;
+        let s = stanza(json, "mydb").unwrap().unwrap();
+        let b = &s.backups_oldest_first()[0];
+        assert_eq!(s.version_of(b), None);
+        assert_eq!(s.current_version(), None);
     }
 }

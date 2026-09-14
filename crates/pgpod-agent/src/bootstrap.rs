@@ -145,7 +145,12 @@ fn run_initdb(opts: &InitdbOptions) -> Result<()> {
 }
 
 /// Append `include_dir 'conf.d'` to postgresql.conf, exactly once.
-fn append_include_dir(pgdata: &Path) -> Result<()> {
+///
+/// Also the last step of a major upgrade: `pg_upgrade`'s new cluster comes
+/// from a fresh `initdb`, so without this it would start ignoring every
+/// setting pgpod manages — `archive_mode` among them, which would stay
+/// silent until a restore needed the WAL that was never shipped.
+pub(crate) fn append_include_dir(pgdata: &Path) -> Result<()> {
     use std::io::Write as _;
     let path = pgdata.join("postgresql.conf");
     let existing =

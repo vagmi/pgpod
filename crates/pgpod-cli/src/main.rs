@@ -113,6 +113,11 @@ enum Command {
         /// `2026-09-04T10:00:00Z`. Omit to replay everything available.
         #[arg(long)]
         at: Option<String>,
+        /// Image for the restored cluster. Needed only to restore a
+        /// backup taken *before* a major upgrade, which can only be read
+        /// by the PostgreSQL that wrote it.
+        #[arg(long)]
+        image: Option<String>,
         #[arg(long, default_value_t = 1800)]
         wait: u64,
     },
@@ -126,7 +131,50 @@ enum Command {
         /// archive has.
         #[arg(long)]
         at: Option<String>,
+        /// Image for the forked cluster. See `restore --image`.
+        #[arg(long)]
+        image: Option<String>,
         #[arg(long, default_value_t = 1800)]
+        wait: u64,
+    },
+
+    /// Upgrade a cluster to a new PostgreSQL major version.
+    ///
+    /// Holds clients at the pooler, runs `pg_upgrade` in a job container,
+    /// and brings the instance back on the new image. With no pooler in
+    /// front it is an ordinary outage; with one, open connections wait
+    /// (ADR 06).
+    Upgrade {
+        cluster: String,
+        /// Image to upgrade to, e.g. `postgres:18`. Its major version is
+        /// read from the image, not from the tag.
+        #[arg(long = "to-image")]
+        to_image: String,
+        /// `link` hard-links the data files: seconds regardless of size,
+        /// and one-way — the old cluster cannot be started afterwards.
+        /// `copy` leaves the old cluster startable and takes as long as
+        /// the data is big.
+        #[arg(long, default_value = "link", value_parser = parse_method)]
+        method: pgpod_core::UpgradeMethod,
+        /// `pg_upgrade --jobs`.
+        #[arg(long, default_value_t = 2)]
+        jobs: u32,
+        /// Rehearse it: run `pg_upgrade --check` and put the cluster back
+        /// as it was. Still stops the instance — pg_upgrade cannot read a
+        /// running cluster — so it is a short outage that changes nothing.
+        #[arg(long)]
+        check: bool,
+        /// Skip `vacuumdb --analyze-in-stages` afterwards. pg_upgrade does
+        /// not carry planner statistics over, so skipping this means the
+        /// upgraded cluster plans against none.
+        #[arg(long)]
+        no_analyze: bool,
+        /// Skip the post-upgrade backup. The repository's existing backups
+        /// belong to the pre-upgrade cluster.
+        #[arg(long)]
+        no_backup: bool,
+        /// Seconds to wait for the upgraded instance to accept connections.
+        #[arg(long, default_value_t = 300)]
         wait: u64,
     },
 
@@ -214,6 +262,7 @@ async fn main() -> Result<()> {
             cluster,
             target,
             at,
+            image,
             wait,
         }
         // `fork` is `restore` with the target defaulting to now — paagan's
@@ -224,9 +273,35 @@ async fn main() -> Result<()> {
             cluster,
             target,
             at,
+            image,
             wait,
         } => emit(
-            commands::restore(&cluster, &target, at.as_deref(), wait).await?,
+            commands::restore(&cluster, &target, at.as_deref(), image.as_deref(), wait).await?,
+            format,
+        ),
+        Command::Upgrade {
+            cluster,
+            to_image,
+            method,
+            jobs,
+            check,
+            no_analyze,
+            no_backup,
+            wait,
+        } => emit(
+            commands::upgrade(
+                &cluster,
+                pgpod_control::UpgradeOptions {
+                    to_image,
+                    method,
+                    jobs,
+                    check,
+                    analyze: !no_analyze,
+                    backup: !no_backup,
+                    wait: std::time::Duration::from_secs(wait),
+                },
+            )
+            .await?,
             format,
         ),
         Command::Delete { cluster, purge } => {
@@ -252,6 +327,12 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse `--method`, so an unknown value is refused by clap with the two
+/// that are allowed rather than by the job container half a minute later.
+fn parse_method(raw: &str) -> std::result::Result<pgpod_core::UpgradeMethod, String> {
+    raw.parse()
 }
 
 fn emit(value: impl CommandOutput, format: OutputFormat) {
