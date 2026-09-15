@@ -39,7 +39,10 @@ pub enum Mount {
     /// never written to.
     BindReadOnly { source: String, target: String },
     /// A tmpfs. The container root filesystem is read-only, so `/tmp` and
-    /// the postgres socket directory need these.
+    /// the secrets directory need these.
+    ///
+    /// Always mounted `mode=1777`, which a container that restarts depends
+    /// on — see the mount construction in `create_container`.
     Tmpfs { target: String },
 }
 
@@ -588,7 +591,33 @@ impl PodmanClient {
                         destination: Some(target.clone()),
                         source: None,
                         _type: Some("tmpfs".into()),
-                        options: Some(vec!["rw".into(), "nosuid".into(), "nodev".into()]),
+                        // **`mode=1777` is load-bearing, not decoration.**
+                        // Without it podman mounts a tmpfs `1777` when the
+                        // container is first created and `0755` root-owned
+                        // on every subsequent `start` — so a container that
+                        // ran happily as a non-root uid cannot write to its
+                        // own tmpfs after a restart. For the pooler, whose
+                        // agent renders `pg_doorman.yaml` into `/pooler` on
+                        // every start, that is fatal: it exits with
+                        // "could not write /pooler/pg_doorman.yaml:
+                        // Permission denied" seconds after coming back, and
+                        // the container looks briefly healthy first.
+                        //
+                        // Found by boot recovery, which is the feature that
+                        // makes `podman start` a normal path rather than a
+                        // rare one. Verified on podman 5.7.0 and 6.1.1: the
+                        // mode is stable across repeated restarts once it is
+                        // stated explicitly.
+                        //
+                        // 1777 is what the first start already used, so this
+                        // grants nothing new — it stops the *second* start
+                        // from silently granting less.
+                        options: Some(vec![
+                            "rw".into(),
+                            "nosuid".into(),
+                            "nodev".into(),
+                            "mode=1777".into(),
+                        ]),
                         uid_mappings: None,
                         gid_mappings: None,
                     });

@@ -111,6 +111,122 @@ impl FromStr for InstancePhase {
     }
 }
 
+/// Where a *cluster* is in its lifecycle, as the registry records it.
+///
+/// Deliberately a parsed enum rather than the bare `String` the registry
+/// column holds. The instance phase has been an enum since Phase 1 while
+/// the cluster phase was free text, and that asymmetry is exactly where a
+/// typo turns into a silent skip: code comparing against `"running"` sees
+/// `"Running"` as an unknown state and quietly does nothing.
+///
+/// Parsing stays lenient at the edges — [`ClusterPhase::parse_lenient`]
+/// maps anything unrecognised to [`ClusterPhase::Unknown`] rather than
+/// failing — because a value written by an older pgpod must not make
+/// `pgpod status` error out on every cluster. `Unknown` is then treated as
+/// "not safe to act on", which is the conservative direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClusterPhase {
+    /// An `apply` is in flight. Containers may be half-created and the
+    /// stored manifest may be ahead of what is running.
+    Applying,
+    /// The last operation completed. This is the only phase in which the
+    /// cluster is known to be exactly what its manifest describes.
+    Running,
+    /// A major-version upgrade holds the cluster here for its whole
+    /// window — from the pooler hold to the image swap (ADR 06). A host
+    /// that reboots inside it comes back with the primary's container
+    /// stopped or removed and its data mid-migration.
+    Upgrading,
+    /// `pgpod delete` without `--purge`. The containers are gone and the
+    /// volumes were kept on purpose. This is an operator's intent, not a
+    /// fault, and nothing should undo it on its own.
+    Stopped,
+    /// An operation failed with the cluster already recorded. Distinct
+    /// from `Applying` precisely so a failure is not mistaken for work
+    /// still in progress: nothing clears this but another `apply`.
+    Failed,
+    /// A phase string this version does not recognise — from a newer
+    /// pgpod, or a hand-edited registry.
+    Unknown,
+}
+
+impl ClusterPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Applying => "applying",
+            Self::Running => "running",
+            Self::Upgrading => "upgrading",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether boot recovery may start this cluster's containers.
+    ///
+    /// Only `Running` qualifies, and the reason is the same for each of
+    /// the others: they describe a cluster whose on-disk state a human
+    /// has to reconcile with its records. `Applying` and `Upgrading` mean
+    /// an operation was cut off partway; `Stopped` is a deliberate
+    /// shutdown; `Failed` needs the manifest fixed; `Unknown` is not
+    /// understood at all. Starting containers under any of them would be
+    /// guessing at intent, and the guess is unattended.
+    pub fn resumable(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    /// Why this cluster is not resumable, phrased for an operator.
+    ///
+    /// Returns `None` when it is. Each answer names the way out, because
+    /// a boot report that only says "skipped" leaves someone reading
+    /// source to find out what to do.
+    pub fn skip_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Running => None,
+            Self::Applying => Some(
+                "an apply was interrupted — re-run `pgpod apply -f <manifest>` \
+                 to finish it",
+            ),
+            Self::Upgrading => Some(
+                "an upgrade was interrupted — check `pgpod status` and the \
+                 instance volume before starting anything",
+            ),
+            Self::Stopped => {
+                Some("deliberately stopped — `pgpod apply -f <manifest>` brings it back")
+            }
+            Self::Failed => Some("the last apply failed — fix the manifest and apply it again"),
+            Self::Unknown => {
+                Some("its recorded phase is not one this version of pgpod understands")
+            }
+        }
+    }
+
+    /// Parse a stored phase, mapping anything unrecognised to
+    /// [`ClusterPhase::Unknown`].
+    ///
+    /// There is no `FromStr` on purpose. Every caller reads this from the
+    /// registry, where an unknown value is a thing to report rather than
+    /// an error to propagate, and offering a failing parse alongside would
+    /// invite using the wrong one.
+    pub fn parse_lenient(s: &str) -> Self {
+        match s {
+            "applying" => Self::Applying,
+            "running" => Self::Running,
+            "upgrading" => Self::Upgrading,
+            "stopped" => Self::Stopped,
+            "failed" => Self::Failed,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for ClusterPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What the database reports about itself, read from
 /// `pg_is_in_recovery()` — never inferred from the registry (ADR 02 §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +351,80 @@ mod tests {
             InstanceRole::Unknown,
         ] {
             assert_eq!(InstanceRole::from_str(r.as_str()).unwrap(), r);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cluster_phase_tests {
+    use super::*;
+
+    const ALL: [ClusterPhase; 6] = [
+        ClusterPhase::Applying,
+        ClusterPhase::Running,
+        ClusterPhase::Upgrading,
+        ClusterPhase::Stopped,
+        ClusterPhase::Failed,
+        ClusterPhase::Unknown,
+    ];
+
+    #[test]
+    fn known_phases_round_trip_via_str() {
+        for p in ALL {
+            assert_eq!(ClusterPhase::parse_lenient(p.as_str()), p);
+        }
+    }
+
+    #[test]
+    fn only_a_running_cluster_may_be_resumed() {
+        // The whole point of the enum. Every other phase describes a
+        // cluster whose records and on-disk state a human has to
+        // reconcile, and boot recovery runs with nobody watching.
+        assert!(ClusterPhase::Running.resumable());
+        for p in ALL.iter().filter(|p| **p != ClusterPhase::Running) {
+            assert!(!p.resumable(), "{p} must not be resumable");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_phase_is_unknown_rather_than_an_error() {
+        // A value from a newer pgpod, or a hand-edited row, must not make
+        // every command that reads the registry fail — and must not be
+        // mistaken for something safe to act on either.
+        for s in ["", "Running", "promoting", "garbage"] {
+            assert_eq!(
+                ClusterPhase::parse_lenient(s),
+                ClusterPhase::Unknown,
+                "{s:?} should parse as unknown"
+            );
+        }
+        assert!(!ClusterPhase::Unknown.resumable());
+    }
+
+    #[test]
+    fn every_skipped_phase_says_why_and_the_resumable_one_does_not() {
+        // A boot report that only says "skipped" sends the reader to the
+        // source to find out what to do about it.
+        assert!(ClusterPhase::Running.skip_reason().is_none());
+        for p in ALL.iter().filter(|p| **p != ClusterPhase::Running) {
+            let reason = p
+                .skip_reason()
+                .unwrap_or_else(|| panic!("{p} needs a reason"));
+            assert!(!reason.is_empty(), "{p} has an empty reason");
+        }
+    }
+
+    #[test]
+    fn the_phases_apply_and_upgrade_actually_write_are_all_known() {
+        // These are the literals in pgpod-control. If one is renamed
+        // there without being added here, `parse_lenient` starts
+        // returning Unknown and boot recovery silently stops resuming.
+        for written in ["applying", "running", "upgrading", "stopped", "failed"] {
+            assert_ne!(
+                ClusterPhase::parse_lenient(written),
+                ClusterPhase::Unknown,
+                "{written} is written by pgpod-control but not understood here"
+            );
         }
     }
 }

@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use pgpod_control::{
-    ApplyOptions, ApplyReport, BackupReport, ClusterStatus, DeleteReport, Pgpod, PoolerReport,
-    RestoreReport, UpgradeOptions, UpgradeReport,
+    ApplyOptions, ApplyReport, BackupReport, ClusterStatus, DaemonLock, DeleteReport, Pgpod,
+    PoolerReport, RestoreReport, ResumeReport, UpgradeOptions, UpgradeReport,
 };
 use pgpod_core::{ClusterId, InstanceId, Manifest, PoolerId};
 use pgpod_runtime::ExecSpec;
@@ -806,4 +806,114 @@ pub async fn upgrade(cluster: &str, options: UpgradeOptions) -> Result<UpgradeRe
     let id = ClusterId::new(cluster.to_string())?;
     let pgpod = Pgpod::open()?;
     Ok(pgpod.upgrade(&id, options).await?)
+}
+
+// ---- daemon ---------------------------------------------------------
+
+impl CommandOutput for ResumeReport {
+    fn to_text(&self) -> String {
+        if self.clusters.is_empty() && self.poolers.is_empty() {
+            return "nothing to resume — no clusters or poolers are known to pgpod\n".to_string();
+        }
+        let mut out = String::new();
+        for c in &self.clusters {
+            out.push_str(&format!("cluster {} ({})\n", c.cluster, c.phase));
+            if let Some(why) = &c.skipped {
+                out.push_str(&format!("  skipped: {why}\n"));
+            }
+            for i in &c.instances {
+                out.push_str(&unit_line(i));
+            }
+        }
+        if !self.poolers.is_empty() {
+            out.push_str("poolers\n");
+            for p in &self.poolers {
+                out.push_str(&unit_line(p));
+            }
+        }
+        out.push_str(&format!("\n{}\n", self.counts()));
+        if self.needs_attention() {
+            out.push_str(
+                "\nSomething needs attention above. Nothing was created or \
+                 destroyed — boot recovery only starts what was already there.\n",
+            );
+        }
+        out
+    }
+}
+
+fn unit_line(u: &pgpod_control::UnitResume) -> String {
+    match &u.detail {
+        Some(d) => format!("  {:<12} {:<9} {}\n", u.name, u.action, d),
+        None => format!("  {:<12} {}\n", u.name, u.action),
+    }
+}
+
+/// Bring back what was running, then hold the lock until asked to stop.
+///
+/// The long-running mode does nothing after the initial resume — there is
+/// no reconcile loop yet. It stays alive anyway because that is what makes
+/// `systemctl --user status pgpod-daemon` mean "boot recovery ran", and
+/// because it is where the loop lands when it arrives.
+pub async fn daemon(once: bool) -> Result<Option<ResumeReport>> {
+    // A root daemon would talk to root's podman, whose graph root holds
+    // none of this host's state — so the symptom would be an empty host
+    // rather than a privilege mistake. Refused outright (principle 1).
+    if nix::unistd::Uid::current().is_root() {
+        bail!(
+            "pgpod daemon must not run as root. It manages rootless podman \
+             containers owned by an unprivileged user, and as root it would \
+             read a different graph root entirely — reporting an empty host \
+             rather than the clusters you are looking for.\n\n\
+             Install it as a user unit instead: ops/install-pgpod.sh"
+        );
+    }
+
+    let layout = pgpod_core::PathLayout::from_env();
+    // Held for the whole run, so a hand-run `pgpod daemon --once` cannot
+    // resume the same clusters as the unit at the same moment.
+    let _lock = DaemonLock::acquire(&layout).context("could not take the daemon lock")?;
+
+    let pgpod = Pgpod::open()?;
+    let report = pgpod.resume().await?;
+
+    if once {
+        return Ok(Some(report));
+    }
+
+    // Long-running: the report goes to the journal rather than to stdout,
+    // because nobody is reading stdout of a systemd unit.
+    tracing::info!("boot recovery: {}", report.counts());
+    for c in &report.clusters {
+        if let Some(why) = &c.skipped {
+            tracing::warn!("cluster {} skipped: {why}", c.cluster);
+        }
+        for i in c.instances.iter().filter(|i| i.detail.is_some()) {
+            tracing::warn!(
+                "{}: {} — {}",
+                i.name,
+                i.action,
+                i.detail.as_deref().unwrap_or_default()
+            );
+        }
+    }
+
+    tracing::info!("pgpod daemon ready; waiting for shutdown");
+    wait_for_shutdown().await?;
+    // Containers deliberately outlive the daemon: restarting it must not
+    // be an outage, and the next start adopts whatever is still up.
+    tracing::info!("pgpod daemon stopping; containers are left running");
+    Ok(None)
+}
+
+/// Block until systemd (or a terminal) asks us to stop.
+async fn wait_for_shutdown() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut int = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+    Ok(())
 }

@@ -36,6 +36,21 @@ enum Command {
     /// Check that this host can run pgpod. Run this first.
     Doctor,
 
+    /// Bring back the clusters that were running, then stay up.
+    ///
+    /// This is what a host reboot needs: pgpod's containers are created
+    /// with no podman restart policy, so nothing starts them on their own.
+    /// Installed as a `systemd --user` unit by ops/install-pgpod.sh.
+    Daemon {
+        /// Resume once and exit, instead of staying up.
+        ///
+        /// The same work the unit does at boot, but reported on stdout —
+        /// useful to bring a host back by hand, and to see what the daemon
+        /// would do without starting one.
+        #[arg(long)]
+        once: bool,
+    },
+
     /// Create or converge a cluster or pooler from a manifest.
     Apply {
         /// Path to the manifest. Its `kind` selects what is applied.
@@ -234,6 +249,13 @@ async fn main() -> Result<()> {
             // Diagnostics are the output: a failing host exits non-zero
             // with a clean report, not an error dumped over the top of it.
             std::process::exit(report.exit_code());
+        }
+        Command::Daemon { once } => {
+            // The long-running mode returns nothing to print: its report
+            // went to the journal, and it only gets here on shutdown.
+            if let Some(report) = commands::daemon(once).await? {
+                emit(report, format);
+            }
         }
         Command::Apply {
             file,

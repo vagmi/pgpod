@@ -1034,6 +1034,7 @@ name = "pgpod-control"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "nix",
  "pgpod-backup",
  "pgpod-core",
  "pgpod-pg",

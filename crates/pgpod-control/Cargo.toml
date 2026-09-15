@@ -20,6 +20,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# For the daemon's advisory lock (flock).
+nix.workspace = true
 rand.workspace = true
 
 [dev-dependencies]

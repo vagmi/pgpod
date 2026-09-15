@@ -275,6 +275,18 @@ impl Pgpod {
 
         // ---- the window ---------------------------------------------
 
+        // The phase moves first, and separately from the manifest. Below,
+        // `put_cluster(&target, "upgrading")` cannot run any earlier than
+        // it does — it swaps the stored *manifest*, which must not happen
+        // before the data on disk is the new version. But the phase is not
+        // the manifest, and leaving it at `running` for the whole window
+        // means a host that reboots mid-upgrade comes back saying the
+        // cluster is running while its primary's container has been
+        // stopped and removed. Anything reading the phase to decide
+        // whether a cluster may be touched needs this fence, and `--check`
+        // opens the same window, so it is inside it too.
+        self.registry.set_cluster_phase(cluster, "upgrading")?;
+
         let mut hold = PoolerHold::acquire(self, cluster).await?;
         let held_count = hold.len();
         let held_from = Instant::now();
@@ -296,6 +308,13 @@ impl Pgpod {
                     &format!("upgrade failed, restarting the old instance: {e}"),
                 )?;
                 if let Err(restart) = self.start_instance(&manifest, &instance, &agent).await {
+                    // The window closed with the cluster down, so the
+                    // phase must not go back to `running`. `failed` is
+                    // what says a human has to look at this before
+                    // anything else acts on the cluster.
+                    if let Err(p) = self.registry.set_cluster_phase(cluster, "failed") {
+                        tracing::warn!("could not record the failed phase for {cluster}: {p}");
+                    }
                     hold.release().await;
                     return Err(Error::Invalid(format!(
                         "the upgrade failed ({e}), and so did bringing the old \
@@ -313,6 +332,10 @@ impl Pgpod {
                 // would turn a failed upgrade into dropped connections
                 // too.
                 let _ = self.wait_ready(&instance, options.wait).await;
+                // The old instance is back on its own image and serving,
+                // so the cluster is exactly what it was before the window
+                // opened — including its phase. Nothing was swapped.
+                self.registry.set_cluster_phase(cluster, "running")?;
                 hold.release_after_recreate().await?;
                 return Err(e);
             }
@@ -323,6 +346,9 @@ impl Pgpod {
             // data, and a measured window.
             self.start_instance(&manifest, &instance, &agent).await?;
             self.wait_ready(&instance, options.wait).await?;
+            // Same image, same data, same phase — a rehearsal leaves
+            // nothing behind, and that includes `upgrading`.
+            self.registry.set_cluster_phase(cluster, "running")?;
             hold.release_after_recreate().await?;
             let held_ms = held_from.elapsed().as_millis();
             self.registry.record_event(

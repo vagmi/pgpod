@@ -53,6 +53,32 @@ pgpod upgrade mydb --to-image docker.io/library/postgres:18
 
 Designed for clusters that can tolerate a small amount of downtime.
 
+### Surviving a reboot
+
+pgpod's containers carry no podman restart policy — the reconciler owns
+restarts, so that a failover can fence an instance without podman
+helpfully starting it again. `pgpod daemon` is what brings them back, as a
+`systemd --user` unit:
+
+```sh
+ops/install-pgpod.sh          # no root needed to install for yourself
+sudo loginctl enable-linger $(id -un)   # the one step that does need root
+```
+
+After a reboot the clusters and poolers that were running come back with
+no human action — 5 seconds from boot to serving, measured on Ubuntu
+26.04. Nothing is created, pulled or bootstrapped on that path: a cluster
+caught mid-`apply` or mid-`upgrade`, a fenced instance, and a container
+podman no longer knows about are all **reported** rather than guessed at.
+
+```sh
+pgpod daemon --once     # do it by hand, on a host with no daemon running
+pgpod doctor            # includes linger, the daemon, and host ports
+```
+
+See [ADR 07](adrs/07-boot-recovery.md) for why this is a daemon rather
+than a podman restart policy or a quadlet per container.
+
 ## Try it
 
 ```sh

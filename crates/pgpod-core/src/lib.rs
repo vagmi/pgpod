@@ -22,7 +22,7 @@ pub use backup::{
 };
 pub use duration::{HumanDuration, ParseDurationError};
 pub use ids::{ClusterId, InstanceId, ParseInstanceIdError, PoolerId};
-pub use lifecycle::{InstancePhase, InstanceRole, ParsePhaseError, ParseRoleError};
+pub use lifecycle::{ClusterPhase, InstancePhase, InstanceRole, ParsePhaseError, ParseRoleError};
 pub use manifest::{
     API_VERSION, BootstrapSpec, ClusterManifest, ClusterSpec, KIND, KIND_POOLER, Manifest,
     ManifestError, Metadata, PgDoormanSpec, PoolMode, PoolRef, PoolerClusterRef, PoolerManifest,

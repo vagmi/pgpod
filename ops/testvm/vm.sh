@@ -39,6 +39,8 @@ Commands:
   list              List all VMs
   status [name]     Show VM state and IP
   console [name]    Attach to the serial console
+  ssh [name] CMD    Run a command in the guest over ssh (no CMD = interactive)
+  reboot [name]     Reboot the guest and wait for it to come back
 
 Options:
   --cpu=N               vCPUs (default: $CPU)
@@ -60,10 +62,14 @@ EOF
 
 # ---------- helpers ----------
 
-vm_exists() { sudo virsh dominfo "$1" &>/dev/null; }
+vm_exists() { sudo -n virsh dominfo "$1" &>/dev/null; }
 
 get_vm_ip() {
   local vm_name=$1 attempts=30 i=0
+  # An explicit address short-circuits the libvirt lookup, which needs
+  # sudo. Useful in CI and in any shell where sudo would prompt — and
+  # harmless otherwise, since the caller is asserting what they know.
+  if [ -n "${PGPOD_TESTVM_IP:-}" ]; then echo "$PGPOD_TESTVM_IP"; return 0; fi
   while [ $i -lt $attempts ]; do
     local ip
     ip=$(sudo virsh domifaddr "$vm_name" 2>/dev/null \
@@ -235,10 +241,67 @@ vm_status() {
   fi
 }
 
+vm_ssh() {
+  local vm_name=$1; shift
+  local ip
+  ip="$(get_vm_ip "$vm_name")" || { echo "Error: no IP for $vm_name" >&2; return 1; }
+  # StrictHostKeyChecking off and a null known-hosts file: these guests are
+  # recreated constantly and always land on a recycled libvirt address, so
+  # a remembered key is guaranteed to be wrong and only ever blocks.
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@${ip}" "$@"
+}
+
+# Reboot and wait for the guest to be back, not merely reachable.
+#
+# Waits on a *changed* boot id rather than on ssh answering. The old sshd
+# keeps accepting connections for a moment after `reboot` is issued, so
+# polling for reachability reports success against the pre-reboot system
+# and every assertion after it tests the wrong boot.
+reboot_vm() {
+  local vm_name=$1
+  local before
+  before="$(vm_ssh "$vm_name" 'cat /proc/sys/kernel/random/boot_id')" \
+    || { echo "Error: could not read the boot id" >&2; return 1; }
+  echo "rebooting $vm_name (boot id $before)"
+  vm_ssh "$vm_name" 'sudo systemctl reboot' || true
+
+  local i=0 now
+  while [ $i -lt 60 ]; do
+    sleep 3
+    now="$(vm_ssh "$vm_name" 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null)" || { i=$((i+1)); continue; }
+    if [ -n "$now" ] && [ "$now" != "$before" ]; then
+      echo "back up (boot id $now)"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  echo "Error: $vm_name did not come back within 3 minutes" >&2
+  return 1
+}
+
 # ---------- argument parsing ----------
 
 [ $# -ge 1 ] || usage
 COMMAND=$1; shift
+
+# `ssh` is parsed apart from everything else: its trailing words are a
+# command for the guest, not options for this script, so they must not
+# reach the option loop below.
+if [ "$COMMAND" = "ssh" ]; then
+  NAME="$VMNAME"
+  # Treat the first word as a VM name only when it really is one, so
+  # `vm.sh ssh uptime` sends `uptime` to the default guest rather than
+  # looking for a VM called "uptime". Matching $VMNAME is checked first
+  # because `vm_exists` needs sudo, which is exactly what is unavailable in
+  # the shells this verb is most useful from.
+  if [ $# -ge 2 ] && [[ "$1" != --* ]] && { [ "$1" = "$VMNAME" ] || vm_exists "$1"; }; then
+    NAME=$1; shift
+  fi
+  vm_ssh "$NAME" "$@"
+  exit $?
+fi
+
 NAME="$VMNAME"
 if [ $# -ge 1 ] && [[ "$1" != --* ]]; then NAME=$1; shift; fi
 for arg in "$@"; do
@@ -259,5 +322,6 @@ case "$COMMAND" in
   list)    sudo virsh list --all ;;
   status)  vm_status "$NAME" ;;
   console) sudo virsh console "$NAME" ;;
+  reboot)  reboot_vm "$NAME" ;;
   *)       usage ;;
 esac

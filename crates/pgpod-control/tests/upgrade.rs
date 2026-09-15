@@ -449,6 +449,15 @@ async fn a_rehearsal_changes_nothing_and_says_whether_it_would_work() {
         server_version(&pg, &cluster).await.starts_with("17"),
         "a rehearsal must leave the cluster on its original major version"
     );
+    // Including the phase. `--check` opens the same window a real upgrade
+    // does, so it fences the cluster the same way — and a rehearsal that
+    // left `upgrading` behind would leave the cluster looking mid-upgrade
+    // to anything that reads the phase before acting.
+    assert_eq!(
+        pg.status(&cluster).await.expect("status").phase,
+        "running",
+        "a rehearsal must put the phase back"
+    );
     let stored = pg
         .registry()
         .require_cluster(&cluster)
@@ -844,7 +853,14 @@ async fn an_upgrade_the_images_cannot_support_leaves_the_cluster_running() {
         "and it must say the data was not touched: {msg}"
     );
 
-    // Back up, on its own image, with its rows — the rollback.
+    // Back up, on its own image, with its rows — the rollback. The phase
+    // is part of that: nothing was swapped, the old instance is serving,
+    // so the cluster is exactly what it was before the window opened.
+    assert_eq!(
+        pg.status(&cluster).await.expect("status").phase,
+        "running",
+        "a rolled-back upgrade must not leave the phase at `upgrading`"
+    );
     assert!(
         server_version(&pg, &cluster).await.starts_with("17"),
         "the failed upgrade must leave the cluster running its old version"

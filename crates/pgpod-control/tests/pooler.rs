@@ -530,3 +530,78 @@ spec:
     let _ = pg.delete_pooler(&pooler).await;
     let _ = pg.delete(&cluster, true).await;
 }
+
+/// Purging a cluster and building it again must produce a *working*
+/// pooler, not one holding a credential for a database that no longer
+/// exists.
+///
+/// The failure this pins is silent and confusing. `ensure_pooler_role`
+/// takes the lookup secret's existence as proof that the `pgpod_pooler`
+/// role exists, so a secret that outlives its cluster makes the next
+/// `apply_pooler` skip creating the role — against a freshly `initdb`'d
+/// database that has none. The pooler starts, reports healthy, and every
+/// client gets "Authentication service unavailable" from an auth_query
+/// that failed with a password mismatch nobody can see.
+///
+/// Found by the reboot-recovery script, which purges and rebuilds.
+#[tokio::test]
+async fn a_pooler_works_again_after_its_cluster_is_purged_and_rebuilt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pg = pgpod(dir.path());
+    let name = format!("pb{}", std::process::id() % 100_000);
+    let cluster = ClusterId::new(name.clone()).unwrap();
+    let pooler_name = format!("{name}p");
+    let pooler = PoolerId::new(pooler_name.clone()).unwrap();
+
+    let _ = pg.delete_pooler(&pooler).await;
+    let _ = pg.delete(&cluster, true).await;
+
+    // First life.
+    pg.apply(&cluster_manifest(&name, "8MB"), READY)
+        .await
+        .expect("apply");
+    pg.apply_pooler(&pooler_manifest(&pooler_name, &name), READY)
+        .await
+        .expect("apply pooler");
+
+    // Tear it all down, data and all.
+    pg.delete_pooler(&pooler).await.expect("delete pooler");
+    pg.delete(&cluster, true).await.expect("purge");
+
+    // Second life, from nothing.
+    pg.apply(&cluster_manifest(&name, "8MB"), READY)
+        .await
+        .expect("re-apply");
+    pg.apply_pooler(&pooler_manifest(&pooler_name, &name), READY)
+        .await
+        .expect("re-apply pooler");
+
+    // The role has to actually be there. Asserted directly rather than
+    // only through a client, so a failure says which half is wrong.
+    let roles = pg
+        .running_container(&cluster.instance(1))
+        .await
+        .expect("instance up")
+        .exec(&ExecSpec::new([
+            "psql",
+            "-X",
+            "-tA",
+            "-h",
+            pgpod_core::container::SOCKET_DIR,
+            "-U",
+            "postgres",
+            "-c",
+            "SELECT rolname FROM pg_roles WHERE rolname = 'pgpod_pooler'",
+        ]))
+        .await
+        .expect("exec psql")
+        .stdout;
+    assert!(
+        roles.contains("pgpod_pooler"),
+        "the rebuilt cluster has no pgpod_pooler role — a stale lookup \
+         secret made apply_pooler skip creating it"
+    );
+
+    let _ = pg.delete_pooler(&pooler).await;
+    let _ = pg.delete(&cluster, true).await;
+}

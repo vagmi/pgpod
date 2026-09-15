@@ -210,6 +210,9 @@ pub async fn run(layout: &PathLayout) -> DoctorReport {
 
     checks.push(check_nofile());
     checks.push(check_agent_binary(layout));
+    checks.push(check_linger());
+    checks.push(check_daemon(layout));
+    checks.push(check_port_range(layout));
     DoctorReport::new(checks)
 }
 
@@ -419,6 +422,164 @@ fn check_agent_binary(layout: &PathLayout) -> Check {
             "agent binary",
             format!("not present at {}", path.display()),
             "built and installed from Phase 1 — nothing uses it yet",
+        )
+    }
+}
+
+/// Whether this user's systemd manager survives logout.
+///
+/// Without linger there is no `systemd --user` between sessions, which
+/// means no podman socket and no pgpod daemon after a reboot — the
+/// clusters simply stay down. The hint exists elsewhere in this report
+/// (inside the socket check's text), but only as prose attached to a
+/// different failure.
+///
+/// Read as a file rather than by running `loginctl`: doctor deliberately
+/// shells out to nothing, and `/var/lib/systemd/linger/<user>` is what
+/// `loginctl enable-linger` actually creates.
+///
+/// A **warning**, not a failure, for the reason `check_agent_binary`
+/// gives: doctor cannot tell a server from a laptop, and on a laptop with
+/// a live login session everything here works without linger. Failing
+/// would make doctor red on every developer machine, which trains people
+/// to stop reading it. The detail says plainly what is given up.
+fn check_linger() -> Check {
+    let user = match nix::unistd::User::from_uid(nix::unistd::Uid::current()) {
+        Ok(Some(u)) => u.name,
+        Ok(None) | Err(_) => {
+            return Check::unknown("linger", "could not resolve the current user's name");
+        }
+    };
+    let path = Path::new("/var/lib/systemd/linger").join(&user);
+    // `symlink_metadata`, not `exists()`: the latter collapses "it is not
+    // there" and "we were not allowed to look", and reporting the second
+    // as a failure would send an operator to fix something that is
+    // already correct.
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Check::pass("linger", format!("enabled for {user}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Check::warn(
+            "linger",
+            format!(
+                "not enabled for {user} — containers stop at logout, and \
+                 nothing brings them back after a reboot"
+            ),
+            format!("sudo loginctl enable-linger {user}"),
+        ),
+        Err(e) => Check::unknown("linger", format!("could not read {}: {e}", path.display())),
+    }
+}
+
+/// Whether a pgpod daemon is up, observed from its lock.
+///
+/// Asked of the lock rather than of systemd because the lock is the thing
+/// that is actually true: a unit can be enabled and dead, or the daemon
+/// can be running from a terminal with no unit at all. Opening the lock
+/// file without `O_CREAT` means asking cannot itself leave one behind.
+fn check_daemon(layout: &PathLayout) -> Check {
+    match pgpod_control::DaemonState::probe(layout) {
+        pgpod_control::DaemonState::Running => Check::pass(
+            "pgpod daemon",
+            "running; clusters will come back after a reboot",
+        ),
+        pgpod_control::DaemonState::NotRunning => Check::warn(
+            "pgpod daemon",
+            "not running — it has run on this host, but is not up now",
+            "systemctl --user start pgpod-daemon.service",
+        ),
+        // A warning, not a failure: every other pgpod command works
+        // without the daemon. Only surviving a reboot does not.
+        pgpod_control::DaemonState::NeverRan => Check::warn(
+            "pgpod daemon",
+            "never started on this host, so a reboot would leave clusters down",
+            "install it as a user unit: ops/install-pgpod.sh",
+        ),
+        pgpod_control::DaemonState::Unknown(e) => Check::unknown(
+            "pgpod daemon",
+            format!("could not read the daemon lock: {e}"),
+        ),
+    }
+}
+
+/// Whether pgpod's recorded host ports sit in the kernel's ephemeral
+/// range, where something else can take them while pgpod is not looking.
+///
+/// pgpod allocates a port by binding `127.0.0.1:0`, so every port it has
+/// ever recorded comes from this range by construction. That is harmless
+/// while the containers hold their ports, and precisely wrong across a
+/// reboot: for the minutes before boot recovery runs, any outbound
+/// connection on the host can land on one, and the instance then cannot
+/// be started at all.
+///
+/// Advisory, because the fix is a host-level decision and the failure is
+/// rare — but it is a failure nobody discovers until the reboot that
+/// matters.
+fn check_port_range(layout: &PathLayout) -> Check {
+    let range = match std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") {
+        Ok(s) => s,
+        Err(e) => {
+            return Check::unknown(
+                "host ports",
+                format!("could not read the ephemeral range: {e}"),
+            );
+        }
+    };
+    let mut parts = range
+        .split_whitespace()
+        .filter_map(|p| p.parse::<u16>().ok());
+    let (Some(low), Some(high)) = (parts.next(), parts.next()) else {
+        return Check::unknown(
+            "host ports",
+            format!("unparseable ephemeral range: {range:?}"),
+        );
+    };
+
+    let db = layout.registry_db();
+    if !db.exists() {
+        return Check::pass(
+            "host ports",
+            format!("ephemeral range {low}-{high}; no clusters yet"),
+        );
+    }
+    let ports = match pgpod_control::recorded_host_ports(layout) {
+        Ok(p) => p,
+        Err(e) => {
+            return Check::unknown(
+                "host ports",
+                format!("could not read {}: {e}", db.display()),
+            );
+        }
+    };
+
+    let exposed: Vec<u16> = ports
+        .into_iter()
+        .filter(|p| *p >= low && *p <= high)
+        .collect();
+    if exposed.is_empty() {
+        Check::pass(
+            "host ports",
+            format!("none inside the ephemeral range {low}-{high}"),
+        )
+    } else {
+        Check::warn(
+            "host ports",
+            format!(
+                "{} published port(s) sit inside the ephemeral range {low}-{high} \
+                 ({}) and could be taken by another process during boot",
+                exposed.len(),
+                exposed
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            format!(
+                "reserve them: sudo sysctl -w net.ipv4.ip_local_reserved_ports={}",
+                exposed
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
         )
     }
 }

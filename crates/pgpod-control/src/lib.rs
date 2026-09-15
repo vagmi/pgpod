@@ -4,6 +4,7 @@
 //! embedder has exactly the same surface (`AGENTS.md` principle 7).
 
 mod backup;
+mod daemon;
 mod names;
 mod password;
 mod pooler;
@@ -23,6 +24,10 @@ use pgpod_runtime::{
 };
 
 pub use backup::{BackupReport, RestoreReport};
+pub use daemon::{
+    ClusterResume, DEFAULT_RESUME_WAIT, DaemonLock, DaemonState, ResumeAction, ResumeCounts,
+    ResumeOptions, ResumeReport, UnitResume, recorded_host_ports,
+};
 pub use names::{LABEL_CLUSTER, LABEL_INSTANCE, LABEL_POOLER, SecretNames};
 pub use pooler::{PoolSummary, PoolerHold, PoolerReport};
 pub use status::{ClusterStatus, InstanceStatus, PoolerStatus};
@@ -297,7 +302,6 @@ impl Pgpod {
         bootstrap: Bootstrap,
         options: ApplyOptions,
     ) -> Result<ApplyReport> {
-        let wait = options.wait;
         let cluster = manifest.cluster_id()?;
         self.validate_parameters(manifest)?;
 
@@ -339,12 +343,70 @@ impl Pgpod {
         self.registry
             .record_event(cluster.as_str(), None, "info", "apply requested")?;
 
+        // Everything past this point runs with the cluster already
+        // recorded as `applying`, so its failure is caught here rather
+        // than propagated straight out. A `?` that escapes leaves the
+        // phase saying `applying` for good: nothing ever resets it, and
+        // the row is then indistinguishable from an apply still in
+        // flight. That matters beyond tidiness — a three-instance cluster
+        // whose third instance had a bad parameter serves perfectly well
+        // from the first two, and anything reading the phase to decide
+        // whether the cluster may be touched (the boot reconciler) would
+        // skip it forever over a failure from weeks ago.
+        //
+        // Only the recorded half is wrapped. Everything above deliberately
+        // writes nothing, so a refusal there leaves no row to correct.
+        let summaries = match self
+            .apply_recorded(
+                manifest,
+                &cluster,
+                bootstrap,
+                options,
+                &agent,
+                desired_image_id,
+            )
+            .await
+        {
+            Ok(summaries) => summaries,
+            Err(e) => {
+                self.record_apply_failure(&cluster, &e);
+                return Err(e);
+            }
+        };
+
+        self.registry.set_cluster_phase(&cluster, "running")?;
+        self.registry
+            .record_event(cluster.as_str(), None, "info", "apply complete")?;
+
+        Ok(ApplyReport {
+            cluster: cluster.to_string(),
+            generation,
+            created: !existed,
+            instances: summaries,
+        })
+    }
+
+    /// The half of `apply` that runs once the cluster has been recorded.
+    ///
+    /// Split from `apply_with_bootstrap` for one reason: so that every way
+    /// it can fail arrives at a single place that can set a terminal
+    /// phase. Inlining it would mean remembering to do that at a dozen
+    /// `?`s, which is how the phase came to be stuck in the first place.
+    async fn apply_recorded(
+        &self,
+        manifest: &ClusterManifest,
+        cluster: &ClusterId,
+        bootstrap: Bootstrap,
+        options: ApplyOptions,
+        agent: &std::path::Path,
+        desired_image_id: Option<String>,
+    ) -> Result<Vec<InstanceSummary>> {
         // One network per cluster even at a single instance, so adding a
         // standby later does not have to move a running primary onto a
         // different network.
         let network = self
             .podman
-            .ensure_network(&cluster.network_name(), &names::cluster_labels(&cluster))
+            .ensure_network(&cluster.network_name(), &names::cluster_labels(cluster))
             .await?;
 
         // Created before any instance starts, because archive_mode is
@@ -353,21 +415,21 @@ impl Pgpod {
         // backups (AGENTS.md principle 4).
         if let Some(volume) = &manifest.spec.backup.volume {
             self.podman
-                .create_volume(volume, &names::cluster_labels(&cluster))
+                .create_volume(volume, &names::cluster_labels(cluster))
                 .await?;
         }
 
         let EnsuredSecrets {
             names: secrets,
             rotate,
-        } = self.ensure_secrets(&cluster, manifest, &bootstrap).await?;
+        } = self.ensure_secrets(cluster, manifest, &bootstrap).await?;
         let ctx = ApplyContext {
             bootstrap,
             network_cidr: network.subnet.clone(),
             secrets,
-            agent: &agent,
+            agent,
             recreate: options.recreate,
-            desired_image_id: desired_image_id.clone(),
+            desired_image_id,
         };
 
         let mut summaries = Vec::new();
@@ -377,6 +439,7 @@ impl Pgpod {
             summaries.push(summary);
         }
 
+        let wait = options.wait;
         if !wait.is_zero() {
             for ordinal in 1..=manifest.spec.instances {
                 self.wait_ready(&cluster.instance(ordinal), wait).await?;
@@ -384,7 +447,7 @@ impl Pgpod {
             // After readiness, because ALTER ROLE needs a writable
             // cluster: a restore is still replaying, and then promoting,
             // right up until it is ready.
-            self.rotate_restored_roles(&cluster, &rotate).await?;
+            self.rotate_restored_roles(cluster, &rotate).await?;
         } else if !rotate.is_empty() {
             // Nothing has waited for the cluster to become writable, so
             // there is no moment at which the rotation could have run.
@@ -399,16 +462,26 @@ impl Pgpod {
             )?;
         }
 
-        self.registry.set_cluster_phase(&cluster, "running")?;
-        self.registry
-            .record_event(cluster.as_str(), None, "info", "apply complete")?;
+        Ok(summaries)
+    }
 
-        Ok(ApplyReport {
-            cluster: cluster.to_string(),
-            generation,
-            created: !existed,
-            instances: summaries,
-        })
+    /// Record that a recorded cluster's apply failed.
+    ///
+    /// Takes no `Result`: this runs on a path that already has a failure
+    /// to report, and a registry write that fails here must not replace
+    /// the error the caller is about to return with a less useful one.
+    fn record_apply_failure(&self, cluster: &ClusterId, error: &Error) {
+        if let Err(e) = self.registry.set_cluster_phase(cluster, "failed") {
+            tracing::warn!("could not record the failed phase for {cluster}: {e}");
+        }
+        if let Err(e) = self.registry.record_event(
+            cluster.as_str(),
+            None,
+            "error",
+            &format!("apply failed: {error}"),
+        ) {
+            tracing::warn!("could not record the failure event for {cluster}: {e}");
+        }
     }
 
     /// Reject reserved parameters before anything is created.
@@ -1045,7 +1118,7 @@ impl Pgpod {
         })
     }
 
-    async fn wait_ready(&self, instance: &InstanceId, timeout: Duration) -> Result<()> {
+    pub(crate) async fn wait_ready(&self, instance: &InstanceId, timeout: Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
         let container = self.podman.container(instance.container_name());
         let mut last = String::new();
@@ -1212,10 +1285,52 @@ impl Pgpod {
             for name in SecretNames::for_cluster(cluster).all() {
                 let _ = self.podman.remove_secret(name).await;
             }
+            // The pooler's lookup credential too, which is **not** in
+            // `SecretNames` — it belongs to the cluster but is created
+            // lazily by `apply_pooler` rather than by `apply`.
+            //
+            // Leaving it behind is not untidiness, it is a trap.
+            // `ensure_pooler_role` treats the secret's existence as proof
+            // that the `pgpod_pooler` role exists in the database and
+            // returns early. So: purge a cluster, recreate it — a fresh
+            // initdb, with no such role — and apply a pooler, and the
+            // role is never created while the pooler confidently
+            // authenticates with the old password. Every client then gets
+            // "Authentication service unavailable", and nothing in the
+            // pooler's own output points at a secret from a cluster that
+            // no longer exists.
+            //
+            // Safe to do here: `delete --purge` is refused outright while
+            // any pooler still fronts this cluster, so by this line
+            // nothing is using it.
+            let _ = self
+                .podman
+                .remove_secret(&names::pooler_lookup_secret(cluster))
+                .await;
             self.registry.delete_cluster(cluster)?;
         } else {
             // Keep the rows: they are what lets a later apply find the
             // retained volumes and reuse the same ports.
+            //
+            // The phase has to move with them. Every container was just
+            // removed, so a row still reading `running` is simply false,
+            // and it is false in the direction that matters:
+            // `InstancePhase::blocks_restart` exists so that anything
+            // reconstructing a cluster from the registry can tell "the
+            // operator took this down" from "this was up when pgpod last
+            // looked", and a stale `running` makes those identical. The
+            // container id goes too — it names something that no longer
+            // exists.
+            //
+            // `--purge` needs no equivalent: `instances` is
+            // `ON DELETE CASCADE` on `clusters` (V1__initial.sql:24), so
+            // `delete_cluster` takes these rows with it.
+            for inst in &instances {
+                let mut rec = inst.clone();
+                rec.phase = InstancePhase::Stopped;
+                rec.container_id = None;
+                self.registry.put_instance(&rec)?;
+            }
             self.registry.set_cluster_phase(cluster, "stopped")?;
         }
 

@@ -1,0 +1,72 @@
+# systemd --user unit for the pgpod daemon.
+#
+# Installed into ~/.config/systemd/user/ by ops/install-pgpod.sh, and
+# enabled with `systemctl --user enable`. Never a system unit: the daemon
+# drives *rootless* podman as an unprivileged user and refuses to start as
+# root, because as root it would read a different graph root entirely and
+# report an empty host (AGENTS.md principle 1).
+#
+# What it is for: pgpod creates every container with no podman restart
+# policy, deliberately — the reconciler owns restarts, and podman's own
+# policy would race it and restart an instance that `pgpod promote` had
+# fenced. The cost is that a host reboot leaves every cluster down. This
+# unit is what starts them again.
+#
+# Requires `loginctl enable-linger <user>` (ops/provision-node.sh does it),
+# or there is no user manager between logins to run this at all.
+
+[Unit]
+Description=pgpod — PostgreSQL operator for rootless Podman
+Documentation=https://github.com/vagmi/pgpod
+
+# `podman.socket` is a user socket; systemd resolves it inside the user
+# manager. Wants= rather than Requires= so that a socket which fails to
+# activate leaves the daemon up to say so, rather than silently taking it
+# down too — the daemon's own error names the socket and the fix.
+Wants=podman.socket
+After=podman.socket
+
+# A permanently broken install should stop retrying and stay failed, where
+# `systemctl --user status` can show why, rather than looping forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# `exec` rather than `simple`: systemd waits for the binary to be exec'd
+# successfully, so a bad ExecStart= fails the start job instead of
+# reporting a unit that is "active" and already gone.
+Type=exec
+ExecStart=%h/bin/pgpod daemon
+Restart=on-failure
+RestartSec=5
+
+# pgpod reads PGPOD_LOG, not RUST_LOG. Setting the wrong one leaves the
+# daemon silent at `warn`, which is the least useful place for it to be.
+Environment=PGPOD_LOG=info
+
+# Deliberately no KillMode=. The default (control-group) is correct and
+# safe here, and the reason is worth recording because it looks dangerous
+# at a glance: pgpod never forks podman — every control-plane call goes
+# over the libpod socket (principle 2) — so conmon is a child of the
+# socket-activated podman.service, not of this unit. Verified on the
+# deployment target (Ubuntu 26.04, podman 5.7.0, cgroupManager=systemd):
+# a container's process sits at
+#   …/user@<uid>.service/user.slice/libpod-<id>.scope/container
+# and its conmon at …/libpod-conmon-<id>.scope — neither inside
+# pgpod-daemon.service. Stopping this unit therefore kills pgpod and
+# nothing else. Setting KillMode=process "for safety" would only disable
+# systemd's final SIGKILL sweep for a daemon that grows children later.
+#
+# What *does* take every container down is `systemctl --user restart
+# user@<uid>.service`. ops/provision-node.sh warns about the same thing.
+
+# Deliberately no PGPOD_HOME=. PathLayout short-circuits on it, so setting
+# it here would give the daemon $PGPOD_HOME/state/pgpod.db while an
+# operator's `pgpod status` — same user, no such variable — reads
+# $HOME/.local/state/pgpod/pgpod.db and reports an empty host. It would
+# also move the runtime directory off tmpfs, making the daemon lock file
+# persistent state with nothing to clean it up. systemd sets HOME, and the
+# XDG defaults fall out of that correctly.
+
+[Install]
+WantedBy=default.target

@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use pgpod_control::Pgpod;
-use pgpod_core::{ClusterId, ClusterManifest, PathLayout};
+use pgpod_core::{ClusterId, ClusterManifest, InstancePhase, PathLayout};
 use pgpod_registry::Registry;
 use pgpod_runtime::{ExecSpec, PodmanClient};
 
@@ -173,6 +173,33 @@ async fn a_manifest_becomes_a_working_cluster_and_delete_keeps_the_data() {
     );
     assert_eq!(deleted.volumes_retained.len(), 1);
 
+    // The rows stay, but they must not still claim the instance is
+    // running: the container was just removed. Anything that rebuilds a
+    // cluster from the registry reads this to tell an operator's
+    // deliberate stop from a crash, and `Stopped` is the phase that says
+    // "do not start this on your own".
+    let stopped = pg.registry().instances(&cluster).expect("rows kept");
+    assert_eq!(
+        stopped.len(),
+        1,
+        "delete without --purge must keep the rows"
+    );
+    assert_eq!(
+        stopped[0].phase,
+        InstancePhase::Stopped,
+        "delete left the instance row claiming {}",
+        stopped[0].phase
+    );
+    assert!(
+        stopped[0].container_id.is_none(),
+        "the row still names a container that was removed"
+    );
+    assert_eq!(
+        pg.status(&cluster).await.expect("status").phase,
+        "stopped",
+        "the cluster phase should say so too"
+    );
+
     // Re-apply: same volume, same port, same data.
     let again = pg.apply(&m, READY_TIMEOUT).await.expect("re-apply");
     assert!(!again.created, "second apply should converge, not create");
@@ -244,4 +271,69 @@ async fn reserved_parameters_are_rejected_before_any_resource_is_made() {
             .is_none(),
         "a rejected manifest left {volume} behind"
     );
+}
+
+/// An apply that fails *after* the cluster is recorded must leave a
+/// terminal phase, and a later apply must be able to clear it.
+///
+/// The phase is not cosmetic. Nothing resets it on its own, so a failure
+/// that left it reading `applying` would leave the row permanently
+/// indistinguishable from an apply still in flight — and anything that
+/// decides whether a cluster may be touched by reading it (boot recovery,
+/// most of all) would skip the cluster forever over a failure from weeks
+/// ago. A cluster that fails must be recoverable by fixing the manifest
+/// and applying it again, with no registry surgery.
+#[tokio::test]
+async fn an_apply_that_fails_after_recording_leaves_a_terminal_phase() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pg = pgpod(dir.path());
+    let name = format!("f{}", std::process::id() % 100_000);
+    let cluster = ClusterId::new(name.clone()).unwrap();
+
+    let _ = pg.delete(&cluster, true).await;
+
+    // `shared_buffers` is not a reserved parameter, so this passes
+    // validation and reaches a real postmaster, which then cannot map
+    // that much shared memory and exits. That is the shape this test
+    // needs: a failure *after* `put_cluster` recorded the cluster,
+    // rather than one refused up front.
+    let bad = ClusterManifest::from_yaml(&format!(
+        "apiVersion: pgpod/v1\nkind: Cluster\nmetadata:\n  name: {name}\nspec:\n  \
+         imageName: {IMAGE}\n  bootstrap:\n    initdb:\n      database: appdb\n      \
+         owner: app\n  postgresql:\n    parameters:\n      shared_buffers: 4096GB\n"
+    ))
+    .expect("manifest parses");
+
+    let err = pg
+        .apply(&bad, Duration::from_secs(60))
+        .await
+        .expect_err("a postmaster that cannot start must fail the apply");
+
+    let status = pg.status(&cluster).await.expect("status");
+    assert_eq!(
+        status.phase, "failed",
+        "a failed apply left the cluster at {:?}, which nothing ever clears \
+         — the original error was: {err}",
+        status.phase
+    );
+    assert!(
+        status
+            .recent_events
+            .iter()
+            .any(|e| e.contains("apply failed")),
+        "the failure should be in the event trail: {:?}",
+        status.recent_events
+    );
+
+    // The way out is fixing the manifest, not touching the registry.
+    pg.apply(&manifest(&name), READY_TIMEOUT)
+        .await
+        .expect("a corrected manifest should recover the cluster");
+    assert_eq!(
+        pg.status(&cluster).await.expect("status").phase,
+        "running",
+        "a successful apply must clear the failed phase"
+    );
+
+    let _ = pg.delete(&cluster, true).await;
 }

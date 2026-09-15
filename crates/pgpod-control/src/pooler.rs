@@ -516,7 +516,11 @@ impl Pgpod {
         })
     }
 
-    async fn wait_pooler_ready(&self, pooler: &PoolerId, timeout: Duration) -> Result<()> {
+    pub(crate) async fn wait_pooler_ready(
+        &self,
+        pooler: &PoolerId,
+        timeout: Duration,
+    ) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
         let container = self.podman.container(pooler.container_name());
         let mut last = String::new();
