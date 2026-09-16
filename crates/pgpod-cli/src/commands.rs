@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use pgpod_control::{
     ApplyOptions, ApplyReport, BackupReport, ClusterStatus, DaemonLock, DeleteReport, Pgpod,
-    PoolerReport, RestoreReport, ResumeReport, UpgradeOptions, UpgradeReport,
+    PoolerReport, RestoreReport, ResumeOptions, ResumeReport, UpgradeOptions, UpgradeReport,
 };
 use pgpod_core::{ClusterId, InstanceId, Manifest, PoolerId};
 use pgpod_runtime::ExecSpec;
@@ -816,6 +816,9 @@ impl CommandOutput for ResumeReport {
             return "nothing to resume — no clusters or poolers are known to pgpod\n".to_string();
         }
         let mut out = String::new();
+        if self.dry_run {
+            out.push_str("dry run — nothing was started, stopped or recorded\n\n");
+        }
         for c in &self.clusters {
             out.push_str(&format!("cluster {} ({})\n", c.cluster, c.phase));
             if let Some(why) = &c.skipped {
@@ -838,6 +841,12 @@ impl CommandOutput for ResumeReport {
                  destroyed — boot recovery only starts what was already there.\n",
             );
         }
+        if self.dry_run && self.counts().would_start > 0 {
+            out.push_str(
+                "\nRun `pgpod daemon --once` to act on this, on a host where \
+                 no daemon is running.\n",
+            );
+        }
         out
     }
 }
@@ -855,7 +864,7 @@ fn unit_line(u: &pgpod_control::UnitResume) -> String {
 /// no reconcile loop yet. It stays alive anyway because that is what makes
 /// `systemctl --user status pgpod-daemon` mean "boot recovery ran", and
 /// because it is where the loop lands when it arrives.
-pub async fn daemon(once: bool) -> Result<Option<ResumeReport>> {
+pub async fn daemon(once: bool, dry_run: bool) -> Result<Option<ResumeReport>> {
     // A root daemon would talk to root's podman, whose graph root holds
     // none of this host's state — so the symptom would be an empty host
     // rather than a privilege mistake. Refused outright (principle 1).
@@ -870,14 +879,28 @@ pub async fn daemon(once: bool) -> Result<Option<ResumeReport>> {
     }
 
     let layout = pgpod_core::PathLayout::from_env();
-    // Held for the whole run, so a hand-run `pgpod daemon --once` cannot
-    // resume the same clusters as the unit at the same moment.
-    let _lock = DaemonLock::acquire(&layout).context("could not take the daemon lock")?;
+
+    // A dry run takes no lock, deliberately. It starts nothing and writes
+    // nothing, so there is no work for a lock to serialise — and the
+    // moment someone wants to ask "what would happen here?" is usually
+    // while the unit is up and holding it.
+    let _lock = if dry_run {
+        None
+    } else {
+        Some(DaemonLock::acquire(&layout).context("could not take the daemon lock")?)
+    };
 
     let pgpod = Pgpod::open()?;
-    let report = pgpod.resume().await?;
+    let report = pgpod
+        .resume_with(ResumeOptions {
+            dry_run,
+            ..Default::default()
+        })
+        .await?;
 
-    if once {
+    // A dry run is always one-shot: there would be nothing for the
+    // long-running mode to do afterwards but idle having changed nothing.
+    if once || dry_run {
         return Ok(Some(report));
     }
 

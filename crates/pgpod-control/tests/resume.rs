@@ -27,7 +27,7 @@
 
 use std::time::Duration;
 
-use pgpod_control::{Pgpod, ResumeAction};
+use pgpod_control::{DaemonLock, Pgpod, ResumeAction, ResumeOptions};
 use pgpod_core::{ClusterId, ClusterManifest, InstancePhase, PathLayout, PoolerId, PoolerManifest};
 use pgpod_registry::Registry;
 use pgpod_runtime::{ExecSpec, PodmanClient};
@@ -426,4 +426,116 @@ async fn resume_refuses_what_an_operator_has_to_decide() {
     );
 
     let _ = pg.delete(&cluster, true).await;
+}
+
+/// A dry run answers the question without touching anything — including
+/// while a daemon holds the lock, which is when the question gets asked.
+#[tokio::test]
+async fn a_dry_run_reports_what_would_happen_and_changes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pg = pgpod(dir.path());
+    let name = format!("dr{}", std::process::id() % 100_000);
+    let cluster = ClusterId::new(name.clone()).unwrap();
+    let _ = pg.delete(&cluster, true).await;
+
+    pg.apply(&cluster_manifest(&name), READY)
+        .await
+        .expect("apply");
+    let instance = format!("{name}-1");
+    sql(
+        &pg,
+        &instance,
+        "CREATE TABLE t(i int); INSERT INTO t VALUES (1)",
+    )
+    .await;
+
+    simulate_reboot(&pg, &cluster).await;
+    let events_before = pg
+        .registry()
+        .recent_events(&cluster, 100)
+        .expect("events")
+        .len();
+
+    let dry = pg
+        .resume_with(ResumeOptions {
+            dry_run: true,
+            ..Default::default()
+        })
+        .await
+        .expect("dry run");
+
+    assert!(dry.dry_run, "the report should say it was a dry run");
+    assert_eq!(
+        action_of(&dry, &instance).action,
+        ResumeAction::WouldStart,
+        "a stopped instance of a running cluster is what a dry run is for"
+    );
+
+    // The load-bearing assertion: it changed nothing.
+    assert!(
+        !pg.podman_container(&instance.parse().unwrap())
+            .probe()
+            .await
+            .expect("probe")
+            .expect("exists")
+            .running,
+        "the dry run started the container"
+    );
+    assert_eq!(
+        pg.registry()
+            .recent_events(&cluster, 100)
+            .expect("events")
+            .len(),
+        events_before,
+        "the dry run wrote events — asking what would happen must not \
+         pollute the record of what did"
+    );
+
+    // Running for real does the thing the dry run described.
+    let real = pg.resume().await.expect("resume");
+    assert!(!real.dry_run);
+    assert_eq!(action_of(&real, &instance).action, ResumeAction::Started);
+    assert_eq!(sql(&pg, &instance, "SELECT count(*) FROM t").await, "1");
+
+    // And now a dry run says there is nothing to do.
+    let after = pg
+        .resume_with(ResumeOptions {
+            dry_run: true,
+            ..Default::default()
+        })
+        .await
+        .expect("dry run");
+    assert_eq!(action_of(&after, &instance).action, ResumeAction::Adopted);
+    assert_eq!(after.counts().would_start, 0);
+
+    let _ = pg.delete(&cluster, true).await;
+}
+
+/// The reason dry run exists: it works while the daemon holds the lock.
+#[tokio::test]
+async fn a_dry_run_needs_no_daemon_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pg = pgpod(dir.path());
+    let layout = PathLayout::new(
+        dir.path().join("config"),
+        dir.path().join("state"),
+        dir.path().join("data"),
+        dir.path().join("run"),
+    );
+
+    // Stand in for a running daemon.
+    let _held = DaemonLock::acquire(&layout).expect("take the lock");
+    assert!(
+        DaemonLock::acquire(&layout).is_err(),
+        "the lock should be exclusive"
+    );
+
+    // A real resume would be refused by the CLI before reaching here; the
+    // dry run is the path that does not ask for the lock at all.
+    pg.resume_with(ResumeOptions {
+        dry_run: true,
+        ..Default::default()
+    })
+    .await
+    .expect("a dry run must work while the daemon holds the lock");
 }

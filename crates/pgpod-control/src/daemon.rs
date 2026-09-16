@@ -51,6 +51,11 @@ pub enum ResumeAction {
     Adopted,
     /// Stopped, and started again. The ordinary boot path.
     Started,
+    /// Stopped and eligible, and a dry run declined to act on it. The
+    /// same decision `Started` comes from, reported rather than taken —
+    /// distinct so that a dry run's output can never be mistaken for a
+    /// record of something that happened.
+    WouldStart,
     /// Left alone deliberately, because of a phase that forbids it.
     Skipped,
     /// The registry names a container podman has never heard of. Resume
@@ -66,6 +71,7 @@ impl ResumeAction {
         match self {
             Self::Adopted => "adopted",
             Self::Started => "started",
+            Self::WouldStart => "would-start",
             Self::Skipped => "skipped",
             Self::Missing => "missing",
             Self::Failed => "failed",
@@ -173,17 +179,18 @@ fn resume_order(mut rows: Vec<InstanceRecord>) -> Vec<InstanceRecord> {
 ///
 /// Only meaningful before starting a *stopped* container. A running one is
 /// holding its own port, and this would report it as taken.
+///
+/// Returns just the fact, with no remedy attached: what to do about it
+/// differs between a real run ("the container was not started") and a dry
+/// run ("it would not start"), and a message carrying both reads wrong in
+/// each.
 fn port_available(port: u16) -> std::result::Result<(), String> {
     match std::net::TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => {
             drop(listener);
             Ok(())
         }
-        Err(e) => Err(format!(
-            "host port {port} is held by another process ({e}); the container \
-             was not started. Free the port and run `pgpod daemon --once`, or \
-             re-apply the manifest to move it."
-        )),
+        Err(e) => Err(format!("host port {port} is held by another process ({e})")),
     }
 }
 
@@ -212,6 +219,10 @@ pub struct ClusterResume {
 pub struct ResumeReport {
     pub clusters: Vec<ClusterResume>,
     pub poolers: Vec<UnitResume>,
+    /// Whether this report describes what *would* happen rather than what
+    /// did. Carried on the report so a consumer of `-o json` can tell the
+    /// two apart without inspecting every action.
+    pub dry_run: bool,
 }
 
 impl ResumeReport {
@@ -228,6 +239,7 @@ impl ResumeReport {
             match u.action {
                 ResumeAction::Adopted => c.adopted += 1,
                 ResumeAction::Started => c.started += 1,
+                ResumeAction::WouldStart => c.would_start += 1,
                 ResumeAction::Skipped => c.skipped += 1,
                 ResumeAction::Missing => c.missing += 1,
                 ResumeAction::Failed => c.failed += 1,
@@ -251,6 +263,8 @@ impl ResumeReport {
 pub struct ResumeCounts {
     pub adopted: usize,
     pub started: usize,
+    /// Only ever non-zero for a dry run.
+    pub would_start: usize,
     pub skipped: usize,
     pub missing: usize,
     pub failed: usize,
@@ -258,6 +272,12 @@ pub struct ResumeCounts {
 
 impl std::fmt::Display for ResumeCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `would start` appears only when it happened, so a real run's
+        // summary line reads exactly as it always has — worth keeping,
+        // because it is the line the journal and the tests match on.
+        if self.would_start > 0 {
+            write!(f, "{} would start, ", self.would_start)?;
+        }
         write!(
             f,
             "{} adopted, {} started, {} skipped, {} missing, {} failed",
@@ -271,12 +291,22 @@ impl std::fmt::Display for ResumeCounts {
 pub struct ResumeOptions {
     /// How long to wait for each started instance to accept connections.
     pub wait: Duration,
+    /// Decide, report, and change nothing.
+    ///
+    /// Every decision is made from the same stored state and the same
+    /// probes as a real run, so the report is what would happen — not a
+    /// separate code path that can drift from one. Nothing is started and
+    /// nothing is waited for, which also means a dry run needs no daemon
+    /// lock: it is safe to ask while the unit is up, which is precisely
+    /// when someone wants to ask.
+    pub dry_run: bool,
 }
 
 impl Default for ResumeOptions {
     fn default() -> Self {
         Self {
             wait: DEFAULT_RESUME_WAIT,
+            dry_run: false,
         }
     }
 }
@@ -319,6 +349,7 @@ impl Pgpod {
                     ClusterPhase::parse_lenient(&record.phase),
                     InstancePhase::Running,
                     Some(record.host_port),
+                    options.dry_run,
                 )
                 .await;
 
@@ -351,7 +382,11 @@ impl Pgpod {
             poolers.push(outcome);
         }
 
-        Ok(ResumeReport { clusters, poolers })
+        Ok(ResumeReport {
+            clusters,
+            poolers,
+            dry_run: options.dry_run,
+        })
     }
 
     async fn resume_cluster(
@@ -378,15 +413,17 @@ impl Pgpod {
         };
 
         if let Some(why) = phase.skip_reason() {
-            self.record_resume_event(
-                name,
-                if phase == ClusterPhase::Stopped {
-                    "info"
-                } else {
-                    "warn"
-                },
-                &format!("boot recovery skipped this cluster: {why}"),
-            );
+            if !options.dry_run {
+                self.record_resume_event(
+                    name,
+                    if phase == ClusterPhase::Stopped {
+                        "info"
+                    } else {
+                        "warn"
+                    },
+                    &format!("boot recovery skipped this cluster: {why}"),
+                );
+            }
             return Ok(ClusterResume {
                 cluster: name.to_string(),
                 phase: phase.to_string(),
@@ -405,6 +442,7 @@ impl Pgpod {
                     phase,
                     row.phase,
                     Some(row.host_port),
+                    options.dry_run,
                 )
                 .await;
 
@@ -426,6 +464,7 @@ impl Pgpod {
             match u.action {
                 ResumeAction::Adopted => c.adopted += 1,
                 ResumeAction::Started => c.started += 1,
+                ResumeAction::WouldStart => c.would_start += 1,
                 ResumeAction::Skipped => c.skipped += 1,
                 ResumeAction::Missing => c.missing += 1,
                 ResumeAction::Failed => c.failed += 1,
@@ -435,7 +474,9 @@ impl Pgpod {
         // One summary event per cluster per boot, not one per instance per
         // decision: `events` is append-only with no retention, and a
         // daemon that restarts would otherwise grow the table forever.
-        if !instances.is_empty() {
+        // A dry run leaves no trace: it writes no events, so asking "what
+        // would happen?" cannot pollute the record of what did.
+        if !instances.is_empty() && !options.dry_run {
             let level = if instances.iter().any(|u| u.action.needs_attention()) {
                 "warn"
             } else {
@@ -457,6 +498,7 @@ impl Pgpod {
     /// Never returns `Err`: everything that can go wrong for a single
     /// container is an outcome to report, not a reason to abandon the rest
     /// of the host.
+    #[allow(clippy::too_many_arguments)]
     async fn resume_container(
         &self,
         name: &str,
@@ -464,6 +506,7 @@ impl Pgpod {
         cluster_phase: ClusterPhase,
         unit_phase: InstancePhase,
         host_port: Option<u16>,
+        dry_run: bool,
     ) -> UnitResume {
         let handle = self.podman.container(container_name);
         let probe = match handle.probe().await {
@@ -501,13 +544,30 @@ impl Pgpod {
                 // Checked only on this branch: a container that is already
                 // running is holding its own port, and pre-flighting it
                 // would report the instance as blocking itself.
-                if let Some(port) = host_port
-                    && let Err(detail) = port_available(port)
-                {
+                //
+                // The check itself binds and immediately drops, so it is
+                // safe in a dry run — and it is most of what makes a dry
+                // run worth running, since a held port is the failure that
+                // only shows up at boot.
+                let port_problem = host_port.and_then(|p| port_available(p).err());
+
+                if dry_run {
+                    return UnitResume {
+                        name: name.to_string(),
+                        action: ResumeAction::WouldStart,
+                        detail: port_problem.map(|d| format!("— but {d}, so it would not start")),
+                    };
+                }
+
+                if let Some(fact) = port_problem {
                     return UnitResume {
                         name: name.to_string(),
                         action: ResumeAction::Failed,
-                        detail: Some(detail),
+                        detail: Some(format!(
+                            "{fact}; the container was not started. Free the \
+                             port and resume again, or re-apply the manifest \
+                             to move it."
+                        )),
                     };
                 }
                 match handle.start().await {
@@ -818,9 +878,11 @@ mod tests {
             err.contains(&port.to_string()),
             "the message must name the port: {err}"
         );
+        // Just the fact — the remedy is added by the caller, because it
+        // differs between a real run and a dry run.
         assert!(
-            err.contains("was not started"),
-            "and say what did not happen: {err}"
+            !err.contains("was not started") && !err.contains("would not start"),
+            "port_available should not decide what to advise: {err}"
         );
         drop(held);
         assert!(
@@ -897,6 +959,7 @@ mod tests {
                 action: ResumeAction::Missing,
                 detail: None,
             }],
+            dry_run: false,
         };
 
         let c = report.counts();
@@ -919,10 +982,72 @@ mod tests {
                 skipped: None,
             }],
             poolers: Vec::new(),
+            dry_run: false,
         };
         assert!(
             !quiet.needs_attention(),
             "an all-adopted boot is uneventful"
         );
+    }
+
+    #[test]
+    fn a_dry_run_reports_the_same_decision_under_a_different_name() {
+        // `decide` is shared by both modes on purpose: a dry run that took
+        // its own path could tell you something a real run would not do.
+        // What differs is only whether the decision is acted on, so the
+        // pure function is identical and the *action* names which happened.
+        for phase in RESTARTABLE {
+            assert_eq!(
+                decide(ClusterPhase::Running, phase, Some(&probe(false))),
+                Decision::Start
+            );
+        }
+        assert_ne!(
+            ResumeAction::WouldStart,
+            ResumeAction::Started,
+            "a dry run's output must never be mistakable for a record of \
+             something that happened"
+        );
+        assert_eq!(ResumeAction::WouldStart.as_str(), "would-start");
+    }
+
+    #[test]
+    fn a_dry_run_needs_no_attention_merely_for_having_work_to_do() {
+        // `would-start` is the expected answer on a host whose daemon is
+        // not running. Flagging it would make the common case look wrong.
+        assert!(!ResumeAction::WouldStart.needs_attention());
+        assert!(ResumeAction::Missing.needs_attention());
+        assert!(ResumeAction::Failed.needs_attention());
+    }
+
+    #[test]
+    fn the_summary_line_is_unchanged_unless_something_would_start() {
+        // The journal and the reboot test both match on this line, so a
+        // real run's wording must not drift because dry run was added.
+        let real = ResumeCounts {
+            adopted: 1,
+            started: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            real.to_string(),
+            "1 adopted, 2 started, 0 skipped, 0 missing, 0 failed"
+        );
+
+        let dry = ResumeCounts {
+            would_start: 2,
+            ..Default::default()
+        };
+        assert!(
+            dry.to_string().starts_with("2 would start, "),
+            "a dry run should lead with what it would do: {dry}"
+        );
+    }
+
+    #[test]
+    fn dry_run_is_off_by_default() {
+        // Defaulting the other way would make `Pgpod::resume` — the call
+        // the daemon makes at boot — silently do nothing.
+        assert!(!ResumeOptions::default().dry_run);
     }
 }

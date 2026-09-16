@@ -33,7 +33,6 @@ POOLER="rebootpool"
 # about pgpod and not about what else the guest happened to bind.
 POOLER_PORT=6544
 
-vm() { "${HERE}/vm.sh" ssh "${VM}" "$@"; }
 log() { printf '\n== %s\n' "$*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "  ok: $*"; }
@@ -46,19 +45,54 @@ BIN="${REPO}/target/${ARCH}-unknown-linux-musl/release/pgpod"
 AGENT="${XDG_DATA_HOME:-${HOME}/.local/share}/pgpod/bin/pgpod-agent-${ARCH}"
 [ -x "${AGENT}" ] || fail "no agent at ${AGENT} — run ops/build-agent.sh"
 
-# `vm.sh status` reaches libvirt through sudo; PGPOD_TESTVM_IP skips that
-# for shells where sudo would prompt, and vm.sh honours the same variable.
-IP="${PGPOD_TESTVM_IP:-$("${HERE}/vm.sh" status "${VM}" | awk '/IP:/ {print $2}')}"
-[ -n "${IP}" ] || fail "could not find ${VM}'s IP — is it running?
-Set PGPOD_TESTVM_IP=<addr> if sudo is unavailable here."
-export PGPOD_TESTVM_IP="${IP}"
-scp_to() {
-  scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-    "$1" "ubuntu@${IP}:$2"
+# The guest is reached over plain ssh, so this test is not tied to the
+# libvirt harness: a GCE instance, a bare-metal box or the local VM are all
+# the same to it. `PGPOD_TESTVM_SSH_TARGET` names the guest directly;
+# otherwise the address comes from PGPOD_TESTVM_IP or from vm.sh, which
+# reaches libvirt through sudo.
+if [ -n "${PGPOD_TESTVM_SSH_TARGET:-}" ]; then
+  TARGET="${PGPOD_TESTVM_SSH_TARGET}"
+else
+  IP="${PGPOD_TESTVM_IP:-$("${HERE}/vm.sh" status "${VM}" | awk '/IP:/ {print $2}')}"
+  [ -n "${IP}" ] || fail "could not find ${VM}'s IP — is it running?
+Set PGPOD_TESTVM_IP=<addr>, or PGPOD_TESTVM_SSH_TARGET=user@host for a
+guest that libvirt does not know about."
+  TARGET="ubuntu@${IP}"
+fi
+
+# These guests are recreated constantly and land on recycled addresses, so
+# a remembered host key is guaranteed to be wrong and only ever blocks.
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          -o LogLevel=ERROR -o ConnectTimeout=15)
+[ -n "${PGPOD_TESTVM_SSH_KEY:-}" ] && SSH_OPTS+=(-i "${PGPOD_TESTVM_SSH_KEY}")
+
+vm() { ssh "${SSH_OPTS[@]}" "${TARGET}" "$@"; }
+scp_to() { scp "${SSH_OPTS[@]}" "$1" "${TARGET}:$2"; }
+
+# Reboot and wait for a *different* boot id, not merely for ssh to answer:
+# the pre-reboot sshd keeps accepting connections for a moment, and polling
+# for reachability would report success against the system we just asked to
+# go away — after which every assertion tests the wrong boot.
+reboot_guest() {
+  local before now i=0
+  before="$(vm 'cat /proc/sys/kernel/random/boot_id')" \
+    || fail "could not read the boot id"
+  echo "rebooting ${TARGET} (boot id ${before})"
+  vm 'sudo systemctl reboot' || true
+  while [ $i -lt 80 ]; do
+    sleep 3
+    now="$(vm 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null)" || { i=$((i+1)); continue; }
+    if [ -n "${now}" ] && [ "${now}" != "${before}" ]; then
+      echo "back up (boot id ${now})"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  fail "${TARGET} did not come back within 4 minutes"
 }
 
 # ---------------------------------------------------------------------------
-log "installing pgpod on ${VM} (${IP})"
+log "installing pgpod on ${TARGET}"
 # ---------------------------------------------------------------------------
 
 vm 'mkdir -p pgpod-ops/ops .local/share/pgpod/bin'
@@ -177,7 +211,7 @@ vm 'systemctl --user start pgpod-daemon.service'
 log "REBOOT — nothing is touched after this point"
 # ---------------------------------------------------------------------------
 
-"${HERE}/vm.sh" reboot "${VM}"
+reboot_guest
 
 # Wait for the *daemon* to finish, not for a fixed sleep: the claim is "no
 # human action", and polling a readiness signal is not an action.
@@ -280,4 +314,4 @@ log "PASS — the host rebooted and the cluster came back with no human action"
 
 echo
 echo "Clean up with:"
-echo "  ops/testvm/vm.sh ssh ${VM} '~/bin/pgpod pooler delete ${POOLER}; ~/bin/pgpod delete ${CLUSTER} --purge'"
+echo "  ssh ${TARGET} '~/bin/pgpod pooler delete ${POOLER}; ~/bin/pgpod delete ${CLUSTER} --purge'"

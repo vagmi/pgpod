@@ -76,8 +76,14 @@ pgpod daemon --once     # do it by hand, on a host with no daemon running
 pgpod doctor            # includes linger, the daemon, and host ports
 ```
 
+```sh
+pgpod daemon --dry-run  # what would boot recovery do? changes nothing
+```
+
 See [ADR 07](adrs/07-boot-recovery.md) for why this is a daemon rather
-than a podman restart policy or a quadlet per container.
+than a podman restart policy or a quadlet per container, and
+[docs/usage-gce.md](docs/usage-gce.md) for a start-to-finish setup on a
+fresh cloud VM, `gcloud` commands included.
 
 ## Try it
 

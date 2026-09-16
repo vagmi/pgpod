@@ -49,6 +49,14 @@ enum Command {
         /// would do without starting one.
         #[arg(long)]
         once: bool,
+
+        /// Report what resume would do, and change nothing.
+        ///
+        /// Takes no daemon lock and writes no events, so it is safe to ask
+        /// while the unit is running — which is when the question usually
+        /// comes up. Implies `--once`.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Create or converge a cluster or pooler from a manifest.
@@ -250,10 +258,10 @@ async fn main() -> Result<()> {
             // with a clean report, not an error dumped over the top of it.
             std::process::exit(report.exit_code());
         }
-        Command::Daemon { once } => {
+        Command::Daemon { once, dry_run } => {
             // The long-running mode returns nothing to print: its report
             // went to the journal, and it only gets here on shutdown.
-            if let Some(report) = commands::daemon(once).await? {
+            if let Some(report) = commands::daemon(once, dry_run).await? {
                 emit(report, format);
             }
         }
