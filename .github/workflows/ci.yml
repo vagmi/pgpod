@@ -24,10 +24,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
 
-  # Everything that needs a real rootless podman socket. GitHub's
-  # ubuntu-latest runner is not yet 26.04, so this exercises the *other*
-  # end of the version span deliberately (adrs/03 §3) — the 26.04 target
-  # itself is covered by ops/testvm.
   podman:
     runs-on: ubuntu-26.04
     steps:
@@ -43,9 +39,6 @@ jobs:
 
       - name: Pin netavark as the network backend
         run: |
-          # Runners older than 26.04 still default to CNI, where
-          # `network inspect` succeeds for a network `run --network`
-          # cannot find (adrs/03 §1).
           sudo install -d -m 0755 /etc/containers
           printf '[network]\nnetwork_backend = "netavark"\n' \
             | sudo tee -a /etc/containers/containers.conf
@@ -60,6 +53,9 @@ jobs:
 
       - name: Build and install the static agent
         run: ops/build-agent.sh
+
+      - name: Build and install the pgBackRest bundle
+        run: ops/build-pgbackrest.sh
 
       - name: pgpod doctor
         run: cargo run -p pgpod-cli -- doctor
