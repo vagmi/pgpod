@@ -85,6 +85,27 @@ than a podman restart policy or a quadlet per container, and
 [docs/usage-gce.md](docs/usage-gce.md) for a start-to-finish setup on a
 fresh cloud VM, `gcloud` commands included.
 
+## Install
+
+Statically linked `x86_64-unknown-linux-musl` builds are published on the
+[releases page](https://github.com/vagmi/pgpod/releases). They run on any
+Linux host of that architecture regardless of its glibc — which matters,
+because a build from a rolling distribution will not start on an LTS one.
+
+```sh
+curl -LO https://github.com/vagmi/pgpod/releases/latest/download/pgpod-x86_64-unknown-linux-musl.tar.gz
+tar xzf pgpod-x86_64-unknown-linux-musl.tar.gz
+cd pgpod-*-x86_64-unknown-linux-musl
+./install-pgpod.sh          # no root required
+pgpod doctor
+```
+
+The archive carries `pgpod`, the `pgpod-agent` that runs as PID 1 inside
+every instance container, and the `systemd --user` unit. Provision the host
+first with `ops/provision-node.sh`, and see
+[docs/usage-gce.md](docs/usage-gce.md) for the whole path on a fresh cloud
+VM.
+
 ## Try it
 
 ```sh

@@ -77,9 +77,16 @@ log "installing pgpod for ${TARGET_USER} (uid ${TARGET_UID}, home ${TARGET_HOME}
 # A musl build is preferred when present: it is static, so it runs on a
 # host whose glibc is older than the build machine's. Building pgpod on a
 # rolling distribution and installing it on Ubuntu LTS hits exactly that.
+#
+# `${HERE}/pgpod` comes second, after only an explicit override: it is
+# what an unpacked release tarball looks like, where this script sits
+# beside the binaries it is installing. Checking it before the target/
+# directories means an unpacked release never accidentally installs some
+# stale build from a checkout it happens to be sitting inside.
 find_binary() {
   for candidate in \
     "${PGPOD_BIN_SRC:-}" \
+    "${HERE}/pgpod" \
     "${REPO}/target/${ARCH}-unknown-linux-musl/release/pgpod" \
     "${REPO}/target/release/pgpod" \
     "/tmp/pgpod"; do
@@ -102,6 +109,16 @@ Or point PGPOD_BIN_SRC at one."
 SRC_DATA="${PGPOD_DATA_SRC:-${XDG_DATA_HOME:-${HOME}/.local/share}/pgpod}"
 AGENT_SRC="${SRC_DATA}/bin/pgpod-agent-${ARCH}"
 BUNDLE_SRC="${SRC_DATA}/pgbackrest-${ARCH}"
+
+# In an unpacked release tarball the agent sits beside this script rather
+# than in an XDG tree, so `tar xf … && ./install-pgpod.sh` is the whole
+# installation. An explicit PGPOD_DATA_SRC still wins.
+if [ -z "${PGPOD_DATA_SRC:-}" ] && [ -x "${HERE}/pgpod-agent-${ARCH}" ]; then
+  AGENT_SRC="${HERE}/pgpod-agent-${ARCH}"
+fi
+if [ -z "${PGPOD_DATA_SRC:-}" ] && [ -d "${HERE}/pgbackrest-${ARCH}" ]; then
+  BUNDLE_SRC="${HERE}/pgbackrest-${ARCH}"
+fi
 
 # ---------------------------------------------------------------------------
 # Install

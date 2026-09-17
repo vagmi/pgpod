@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Host-only checks. No podman, no network, no object storage — these
+  # must stay fast enough that nobody is tempted to skip them locally.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace
+
+  # Everything that needs a real rootless podman socket. GitHub's
+  # ubuntu-latest runner is not yet 26.04, so this exercises the *other*
+  # end of the version span deliberately (adrs/03 §3) — the 26.04 target
+  # itself is covered by ops/testvm.
+  podman:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install rootless podman stack
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            podman uidmap passt netavark aardvark-dns fuse-overlayfs
+
+      - name: Pin netavark as the network backend
+        run: |
+          # Runners older than 26.04 still default to CNI, where
+          # `network inspect` succeeds for a network `run --network`
+          # cannot find (adrs/03 §1).
+          sudo install -d -m 0755 /etc/containers
+          printf '[network]\nnetwork_backend = "netavark"\n' \
+            | sudo tee -a /etc/containers/containers.conf
+
+      - name: Start a transient podman service
+        run: |
+          # Same script developers use locally, so CI and the workstation
+          # exercise one code path rather than diverging.
+          eval "$(ops/dev-podman.sh start)"
+          echo "PGPOD_PODMAN_SOCKET=$PGPOD_PODMAN_SOCKET" >> "$GITHUB_ENV"
+          ops/dev-podman.sh status
+
+      - name: Build and install the static agent
+        run: ops/build-agent.sh
+
+      - name: pgpod doctor
+        run: cargo run -p pgpod-cli -- doctor
+
+      - name: Podman integration tests
+        run: cargo test -p pgpod-runtime --features podman-tests -- --nocapture
+
+      - name: End-to-end apply/delete lifecycle
+        run: cargo test -p pgpod-control --features podman-tests -- --nocapture
+
+      - name: Stop the podman service
+        if: always()
+        run: ops/dev-podman.sh stop

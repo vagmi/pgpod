@@ -8,5 +8,8 @@ references
 /ops/testvm/seed*.iso
 /ops/testvm/user-data
 
+# Release staging, built by .github/workflows/release.yml
+/dist/
+
 # Local overrides
 /.pgpod-home/

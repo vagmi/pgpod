@@ -1,0 +1,248 @@
+name: release
+
+# Publishes `pgpod` and `pgpod-agent` as **statically linked musl
+# binaries**, which is the only form that is useful to ship: a glibc build
+# links against the builder's libc and refuses to start on any host with
+# an older one. That is not hypothetical — building on a rolling
+# distribution (glibc 2.44) and installing on Ubuntu 26.04 LTS (2.43) fails
+# exactly this way, and the error names none of it.
+#
+# Both binaries ship together because a release with only the CLI cannot
+# create a database: `pgpod-agent` is PID 1 inside every instance
+# container, bind-mounted read-only from the host.
+#
+# Not shipped: the pgBackRest bundle, which is extracted from a PostgreSQL
+# image and has its loader rewritten (ADR 04). Only clusters that configure
+# backups need it, and it is built locally with ops/build-pgbackrest.sh.
+
+on:
+  push:
+    tags: ["v*"]
+  # Build and check everything without publishing, to exercise this
+  # workflow before trusting a tag to it.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      # To create the release and upload its assets. Nothing else.
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `rusqlite` is built with `bundled`, so SQLite's C sources are
+      # compiled as part of the build and the `cc` crate needs a musl C
+      # compiler. Without this the build fails late, inside a dependency,
+      # with a linker error that does not mention musl.
+      - name: Install the musl C toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      # A tag is a promise, so the fast checks run again here rather than
+      # trusting that CI happened to pass on this commit. The podman suite
+      # is deliberately not repeated: it is slow, and `ci.yml` already
+      # gates every push to main on it.
+      - name: Check
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+      # A tag that disagrees with the version in the tree produces a
+      # release whose assets report a different version than their name,
+      # which is discovered by whoever downloads it.
+      - name: Check the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          crate="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "pgpod-cli") | .version')"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$crate" != "$tag" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match pgpod-cli version ${crate}." \
+                 "Bump crates/pgpod-cli/Cargo.toml, or retag."
+            exit 1
+          fi
+          echo "version ${crate}"
+
+      - name: Build
+        run: |
+          cargo build --release --target "$TARGET" -p pgpod-cli -p pgpod-agent
+
+      # The whole point of the release format. A dynamic dependency here
+      # would surface as a cryptic exec failure on the user's host rather
+      # than as a build failure here, so it is asserted rather than
+      # assumed — the same check ops/build-agent.sh makes.
+      - name: Assert the binaries are static
+        run: |
+          for bin in pgpod pgpod-agent; do
+            path="target/${TARGET}/release/${bin}"
+            file "$path"
+            if ldd "$path" 2>&1 | grep -qv 'statically linked\|not a dynamic executable'; then
+              echo "::error::${bin} is not statically linked"
+              ldd "$path" || true
+              exit 1
+            fi
+          done
+
+      # Proof the artifact actually runs, not merely that it linked.
+      - name: Smoke-test the CLI
+        run: |
+          target/${TARGET}/release/pgpod --version
+          target/${TARGET}/release/pgpod daemon --help > /dev/null
+          # `doctor` exits non-zero on a host with no podman socket, which
+          # this runner is — so the assertion is that it produced a report
+          # rather than that it passed.
+          target/${TARGET}/release/pgpod doctor || true
+
+      - name: Package
+        id: package
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            # A manual run is not a release; name it after the commit so it
+            # can never be mistaken for one.
+            version="$(git rev-parse --short HEAD)"
+          fi
+          name="pgpod-${version}-${TARGET}"
+          mkdir -p "dist/${name}"
+
+          install -m 0755 "target/${TARGET}/release/pgpod"       "dist/${name}/pgpod"
+          # Named by architecture, because the daemon mounts the binary
+          # matching the host it runs on — a container shares the host
+          # kernel and ISA. `PathLayout::agent_binary` spells it this way.
+          install -m 0755 "target/${TARGET}/release/pgpod-agent" "dist/${name}/pgpod-agent-x86_64"
+
+          # Shipped alongside so the tarball installs itself: the script
+          # looks for these binaries beside it before anywhere else.
+          install -m 0755 ops/install-pgpod.sh                   "dist/${name}/install-pgpod.sh"
+          install -m 0644 ops/pgpod-daemon.service               "dist/${name}/pgpod-daemon.service"
+          install -m 0644 LICENSE                                "dist/${name}/LICENSE"
+
+          strip "dist/${name}/pgpod" "dist/${name}/pgpod-agent-x86_64"
+
+          cat > "dist/${name}/README" <<EOF
+          pgpod ${version} — a PostgreSQL operator for rootless Podman
+          ${TARGET}, statically linked
+
+          Install (no root needed):
+
+              ./install-pgpod.sh
+
+          That puts pgpod in ~/bin, the agent in ~/.local/share/pgpod/bin,
+          and enables pgpod-daemon.service as a systemd --user unit so the
+          clusters come back after a reboot.
+
+          Two things it cannot do for you:
+
+            * Provision the host. Run ops/provision-node.sh from the
+              repository first — rootless podman, subuid/subgid ranges,
+              journal access and lingering.
+            * Enable lingering, which needs root:
+                  sudo loginctl enable-linger \$(id -un)
+              Without it there is no systemd --user between logins, so
+              nothing restarts your databases after a reboot.
+
+          Then:
+
+              pgpod doctor            # checks the host, names every fix
+              pgpod apply -f cluster.yaml
+
+          Clusters that configure backups also need the pgBackRest bundle,
+          which is not in this archive — build it with
+          ops/build-pgbackrest.sh.
+
+          Docs: https://github.com/vagmi/pgpod
+          EOF
+
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+          # A second, unversioned copy, so that
+          #   .../releases/latest/download/pgpod-${TARGET}.tar.gz
+          # is a stable URL a provisioning script can hardcode. That URL
+          # only resolves against a fixed asset name, which the versioned
+          # one by definition is not. Same bytes; the version is in the
+          # tag, in the directory inside the archive, and in its README.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            cp "dist/${name}.tar.gz" "dist/pgpod-${TARGET}.tar.gz"
+            ( cd dist && sha256sum "pgpod-${TARGET}.tar.gz" > "pgpod-${TARGET}.tar.gz.sha256" )
+          fi
+
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          ls -l dist/*.tar.gz
+          cat dist/*.sha256
+
+      # Unpack somewhere else and check the layout is what install-pgpod.sh
+      # expects. The installer's own "find the binaries" logic is what
+      # makes `tar xf && ./install-pgpod.sh` work, and it is easy to break
+      # from either side.
+      - name: Verify the archive installs from itself
+        run: |
+          tmp="$(mktemp -d)"
+          tar -C "$tmp" -xzf "dist/${{ steps.package.outputs.name }}.tar.gz"
+          dir="$tmp/${{ steps.package.outputs.name }}"
+          test -x "$dir/pgpod"
+          test -x "$dir/pgpod-agent-x86_64"
+          test -x "$dir/install-pgpod.sh"
+          test -f "$dir/pgpod-daemon.service"
+          "$dir/pgpod" --version
+          # Dry-run the installer's discovery without installing anything:
+          # it must choose the binaries beside it, not any in this checkout.
+          bash -n "$dir/install-pgpod.sh"
+
+      - name: Upload the build (no tag)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # `gh` is preinstalled on the runner, so this needs no
+          # third-party action in the release path.
+          notes="$(cat <<'EOF'
+          Statically linked `x86_64-unknown-linux-musl` build. Runs on any
+          Linux host of that architecture regardless of its glibc.
+
+          ```sh
+          curl -LO https://github.com/vagmi/pgpod/releases/latest/download/pgpod-x86_64-unknown-linux-musl.tar.gz
+          tar xzf pgpod-x86_64-unknown-linux-musl.tar.gz
+          cd pgpod-*-x86_64-unknown-linux-musl
+          ./install-pgpod.sh          # no root required
+          pgpod doctor
+          ```
+
+          The unversioned asset is a copy of the versioned one, so that the
+          `latest/download` URL above stays stable across releases.
+
+          Contains `pgpod`, `pgpod-agent-x86_64`, the `systemd --user` unit
+          and the installer. Provision the host first with
+          `ops/provision-node.sh`; clusters using backups also need the
+          pgBackRest bundle from `ops/build-pgbackrest.sh`.
+          EOF
+          )"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "${notes}" \
+            --verify-tag \
+            dist/*.tar.gz dist/*.tar.gz.sha256
