@@ -24,7 +24,7 @@
 //!
 //! ```sh
 //! eval "$(ops/dev-podman.sh start)"
-//! cargo test -p pgpod-runtime --features podman-tests --test network -- --test-threads=1
+//! cargo test -p pgpod-runtime --features podman-tests --test network
 //! ```
 
 #![cfg(feature = "podman-tests")]

@@ -22,7 +22,7 @@
 //! ```sh
 //! ops/build-agent.sh
 //! eval "$(ops/dev-podman.sh start)"
-//! cargo test -p pgpod-control --features podman-tests --test upgrade -- --nocapture --test-threads=1
+//! cargo test -p pgpod-control --features podman-tests --test upgrade -- --nocapture
 //! ```
 
 #![cfg(feature = "podman-tests")]

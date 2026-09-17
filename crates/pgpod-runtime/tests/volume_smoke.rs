@@ -10,7 +10,7 @@
 //! Requires a live rootless podman socket:
 //!
 //! ```sh
-//! cargo test -p pgpod-runtime --features podman-tests --test volume_smoke -- --nocapture --test-threads=1
+//! cargo test -p pgpod-runtime --features podman-tests --test volume_smoke -- --nocapture
 //! ```
 
 #![cfg(feature = "podman-tests")]

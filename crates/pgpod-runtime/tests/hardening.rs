@@ -10,7 +10,7 @@
 //!
 //! ```sh
 //! eval "$(ops/dev-podman.sh start)"
-//! cargo test -p pgpod-runtime --features podman-tests --test hardening -- --test-threads=1
+//! cargo test -p pgpod-runtime --features podman-tests --test hardening
 //! ```
 
 #![cfg(feature = "podman-tests")]
@@ -225,4 +225,57 @@ fn the_socket_directory_lives_inside_the_volume() {
          of what the image ships: {}",
         pgpod_core::container::SOCKET_DIR
     );
+}
+
+/// Stopping the *last* container using the rootless network namespace must
+/// succeed, even though podman 5.7.0 reports it as a failure.
+///
+/// The bug: `pasta` exits on its own once the namespace has no users left,
+/// podman then kills the pid it recorded, the kill lands on a pid that is
+/// already gone, and the resulting EPERM fails the whole call — after the
+/// container has stopped. Reproduced 6 times out of 6 on the deployment
+/// target through a transient `podman system service`, which is how CI and
+/// `ops/dev-podman.sh` run it.
+///
+/// Three conditions have to line up, which is why this needs its own test
+/// rather than falling out of the others: the container must be the one
+/// that drops the netns refcount to **zero** (anything else running hides
+/// it entirely), the daemon must be a transient service rather than the
+/// socket-activated one, and podman must be 5.7.x — 6.1.1 does not do it.
+///
+/// It passes vacuously on an unaffected host. That is fine: it costs one
+/// container, and on an affected one it is the difference between `pgpod
+/// upgrade` working and failing after it has stopped the primary.
+#[tokio::test]
+async fn stopping_the_last_container_on_a_network_succeeds() {
+    let podman = connect().await;
+    podman.pull_image_if_absent(IMAGE).await.expect("pull");
+    let net = unique("netns-net");
+    let name = unique("netns");
+
+    podman
+        .ensure_network(&net, &[("pgpod.test".to_string(), "true".to_string())])
+        .await
+        .expect("create network");
+
+    let spec = ContainerSpec::hardened(IMAGE)
+        .name(&name)
+        .command(["sleep", "300"])
+        .network(&net)
+        .label("pgpod.test", "true");
+    let c = podman.create_container(&spec).await.expect("create");
+    c.start().await.expect("start");
+
+    // The assertion. Before the fix this returns
+    //   rootless netns: kill network process: permission denied
+    // on an affected host, with the container nevertheless stopped.
+    c.stop(std::time::Duration::from_secs(10))
+        .await
+        .expect("stopping the last container on a network must not fail");
+
+    let probe = c.probe().await.expect("probe").expect("still exists");
+    assert!(!probe.running, "the container should be stopped");
+
+    c.remove(true).await.expect("remove");
+    let _ = podman.remove_network(&net).await;
 }

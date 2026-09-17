@@ -72,6 +72,16 @@ impl PortPublish {
     }
 }
 
+/// Whether a podman error is the spurious rootless-netns teardown failure
+/// described on [`Container::forgive_netns_teardown`].
+///
+/// Deliberately narrow. It matches both halves of podman's message, so a
+/// different network error — one that means something — does not qualify
+/// and is never forgiven on the strength of the container having stopped.
+fn is_netns_teardown_error(detail: &str) -> bool {
+    detail.contains("rootless netns") && detail.contains("kill network process")
+}
+
 /// A podman secret mounted into the container at `target`.
 ///
 /// Secrets go here rather than into `env` because environment variables
@@ -707,13 +717,60 @@ impl Container {
         let opts = podman_api::opts::ContainerStopOpts::builder()
             .timeout(timeout.as_secs() as usize)
             .build();
-        self.client
+        match self
+            .client
             .podman()
             .containers()
             .get(&self.id)
             .stop(&opts)
             .await
-            .map_err(|e| Error::Container(format!("stop {}: {e}", self.id)))
+        {
+            Ok(()) => Ok(()),
+            Err(e) => self.forgive_netns_teardown("stop", e).await,
+        }
+    }
+
+    /// Turn podman's spurious rootless-netns teardown failure into the
+    /// success it actually was — and only then.
+    ///
+    /// podman 5.7.0, the deployment target, reports this when the last
+    /// container using the shared rootless network namespace goes away:
+    ///
+    /// ```text
+    /// removing container <id> network: 1 error occurred:
+    ///   * rootless netns: kill network process: permission denied
+    /// ```
+    ///
+    /// The work succeeded. `pasta` exits on its own once the namespace has
+    /// no users left, podman then kills the pid it recorded, and the kill
+    /// lands on a pid that is gone — reported as `permission denied`
+    /// rather than as "no such process". Measured on the target: the
+    /// container reaches `exited` every time, a following `remove` always
+    /// succeeds, and repeating the same call immediately returns cleanly.
+    ///
+    /// Two conditions have to hold before anything is forgiven, because
+    /// matching on an error string alone is exactly how a real failure
+    /// gets swallowed: the message must carry this signature, **and** the
+    /// container must actually no longer be running. The second is the
+    /// real test; the first only keeps the rule narrow.
+    ///
+    /// Without this, `pgpod delete` and `pgpod upgrade` fail intermittently
+    /// on a supported host, having already done what they were asked.
+    async fn forgive_netns_teardown(&self, op: &str, e: podman_api::Error) -> Result<()> {
+        let detail = e.to_string();
+        if is_netns_teardown_error(&detail) {
+            // Ground truth, not the error text. `probe` returning `None`
+            // means podman no longer knows the container at all, which is
+            // likewise not a running one.
+            match self.probe().await {
+                Ok(None) => return Ok(()),
+                Ok(Some(p)) if !p.running => return Ok(()),
+                // Still running, or we could not tell: report the original
+                // failure rather than a guess about it.
+                _ => {}
+            }
+        }
+        Err(Error::Container(format!("{op} {}: {detail}", self.id)))
     }
 
     /// Ask podman about this container. `Ok(None)` when podman does not
@@ -795,13 +852,21 @@ impl Container {
     /// volume is a separate, explicit call (`AGENTS.md` principle 4).
     pub async fn remove(&self, force: bool) -> Result<()> {
         let opts = ContainerDeleteOpts::builder().force(force).build();
-        self.client
+        match self
+            .client
             .podman()
             .containers()
             .get(&self.id)
             .delete(&opts)
             .await
-            .map_err(|e| Error::Container(format!("delete {}: {e}", self.id)))
+        {
+            Ok(()) => Ok(()),
+            // The same teardown runs here — a forced remove stops the
+            // container first — so the same spurious failure is possible.
+            // Observed on `stop` rather than here, and handled in both
+            // because the difference is timing, not kind.
+            Err(e) => self.forgive_netns_teardown("delete", e).await,
+        }
     }
 }
 
@@ -928,5 +993,53 @@ mod tests {
             target: "/t".into(),
         };
         assert_ne!(vol, bind);
+    }
+}
+
+#[cfg(test)]
+mod netns_teardown_tests {
+    use super::is_netns_teardown_error;
+
+    /// The message podman 5.7.0 actually produces, copied from a run on
+    /// the deployment target rather than paraphrased.
+    const REAL: &str = "error 500 Internal Server Error - removing container \
+        05ad78a4033f6da13a84fd3af8f86e6d7a18358e2d0ff4fc7362cd9e70ad5fd1 network: \
+        1 error occurred:\n\t* rootless netns: kill network process: permission denied\n\n: \
+        permission denied";
+
+    #[test]
+    fn the_real_message_is_recognised() {
+        assert!(is_netns_teardown_error(REAL));
+    }
+
+    #[test]
+    fn other_failures_are_not_forgiven() {
+        // Each of these means something, and swallowing it because the
+        // container happened to be stopped would hide a real problem.
+        for other in [
+            "error 500 Internal Server Error - no such container",
+            "removing container abc network: network not found",
+            "error 409 Conflict - container is in use",
+            "permission denied",
+            "rootless netns: mount failed",
+            "kill network process: no such process",
+            "",
+        ] {
+            assert!(
+                !is_netns_teardown_error(other),
+                "{other:?} should not be treated as the netns teardown bug"
+            );
+        }
+    }
+
+    #[test]
+    fn both_halves_are_required() {
+        // Matching either half alone would be broad enough to catch
+        // unrelated errors that merely mention one of them.
+        assert!(!is_netns_teardown_error("rootless netns: something else"));
+        assert!(!is_netns_teardown_error("kill network process: whatever"));
+        assert!(is_netns_teardown_error(
+            "rootless netns: kill network process: permission denied"
+        ));
     }
 }

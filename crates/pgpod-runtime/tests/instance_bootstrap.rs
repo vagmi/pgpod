@@ -12,7 +12,7 @@
 //! ```sh
 //! ops/build-agent.sh
 //! eval "$(ops/dev-podman.sh start)"
-//! cargo test -p pgpod-runtime --features podman-tests --test instance_bootstrap -- --nocapture --test-threads=1
+//! cargo test -p pgpod-runtime --features podman-tests --test instance_bootstrap -- --nocapture
 //! ```
 
 #![cfg(feature = "podman-tests")]
