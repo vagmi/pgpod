@@ -60,11 +60,32 @@ jobs:
       - name: pgpod doctor
         run: cargo run -p pgpod-cli -- doctor
 
+      # `--test-threads=1` is load-bearing, not tidiness.
+      #
+      # podman 5.7.0 — the deployment target, and this runner — has a race
+      # in rootless network-namespace teardown. The netns is shared by every
+      # container and refcounted; when the count reaches zero podman kills
+      # the network process, and two teardowns arriving together make the
+      # second kill hit a PID that is gone or recycled:
+      #
+      #   removing container <id> network: 1 error occurred:
+      #     * rootless netns: kill network process: permission denied
+      #
+      # Reproduced on 5.7.0 with bare `podman run/stop/rm` and no pgpod
+      # involved — 4 of 4 attempts — and not reproducible on 6.1.1, so it
+      # appears fixed upstream. It needs the refcount to actually reach
+      # zero, which is why it shows up on a clean runner and hides on a
+      # workstation that has anything else running.
+      #
+      # Serialising removes the concurrent teardown. It also matches how
+      # pgpod itself behaves: every stop-then-remove in the control plane
+      # is sequential and awaited, so nothing here is papering over a race
+      # in pgpod's own code.
       - name: Podman integration tests
-        run: cargo test -p pgpod-runtime --features podman-tests -- --nocapture
+        run: cargo test -p pgpod-runtime --features podman-tests -- --nocapture --test-threads=1
 
       - name: End-to-end apply/delete lifecycle
-        run: cargo test -p pgpod-control --features podman-tests -- --nocapture
+        run: cargo test -p pgpod-control --features podman-tests -- --nocapture --test-threads=1
 
       - name: Stop the podman service
         if: always()

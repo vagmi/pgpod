@@ -10,7 +10,7 @@
 //!
 //! ```sh
 //! eval "$(ops/dev-podman.sh start)"
-//! cargo test -p pgpod-runtime --features podman-tests --test hardening
+//! cargo test -p pgpod-runtime --features podman-tests --test hardening -- --test-threads=1
 //! ```
 
 #![cfg(feature = "podman-tests")]
