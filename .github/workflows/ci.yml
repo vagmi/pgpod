@@ -13,7 +13,7 @@ jobs:
   # Host-only checks. No podman, no network, no object storage — these
   # must stay fast enough that nobody is tempted to skip them locally.
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,7 +29,7 @@ jobs:
   # end of the version span deliberately (adrs/03 §3) — the 26.04 target
   # itself is covered by ops/testvm.
   podman:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
